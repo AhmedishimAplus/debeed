@@ -250,6 +250,77 @@ def confirm_mapping(mapping: dict) -> bool:
         print("  Enter y or n.")
 
 # ═══════════════════════════════════════════════════════════════════
+#  CHECK PUBLISH STATUS
+# ═══════════════════════════════════════════════════════════════════
+def check_publish_status(page: Page) -> str:
+    """
+    Check the color of the dot indicator next to 'Publish Unit (Clients)' button.
+    Returns: 'red' (not published), 'green' (already published), 'faded' (already published),
+    or 'disabled' (button is disabled, unit cannot be published).
+    """
+    try:
+        # Use .first to avoid strict mode violation when multiple tabs are open
+        btn = page.locator('button:has-text("Publish Unit (Clients)")').first
+        btn.wait_for(state="visible", timeout=5000)
+        
+        # Check if button is disabled (e.g., duplicate unit already published)
+        if not btn.is_enabled():
+            disabled_msg = btn.get_attribute("title") or "disabled"
+            print(f"   ⚠ Publish button is disabled: {disabled_msg}")
+            return "disabled"
+        
+        dot = btn.locator('span.dot').first
+        dot.wait_for(state="visible", timeout=5000)
+        
+        bg_color = dot.evaluate("el => window.getComputedStyle(el).backgroundColor")
+        
+        if "220, 53, 69" in bg_color:  # rgb(220, 53, 69) — #dc3545 (red/danger)
+            return "red"
+        elif "40, 167, 69" in bg_color:  # rgb(40, 167, 69) — #28a745 (green/success)
+            return "green"
+        else:
+            return "faded"  # Any other color (gray, etc.) = already published
+    except Exception as e:
+        print(f"   ⚠ Could not check publish status: {e} — assuming RED (not published)")
+        return "red"
+
+# ═══════════════════════════════════════════════════════════════════
+#  GO BACK TO LIST (extracted helper)
+# ═══════════════════════════════════════════════════════════════════
+def go_back_to_list(page: Page):
+    """
+    Navigate back to the list page and close any open detail tabs.
+    Used both after publishing and when skipping already-published units.
+    """
+    print("   ↩ Going back to list page...")
+    page.locator("button, a", has_text=re.compile(r"\bBack\b", re.IGNORECASE)).first.click(timeout=5_000)
+    page.wait_for_load_state("networkidle", timeout=15_000)
+    page.wait_for_timeout(500)
+
+    # Close any open detail tabs so the next card always opens fresh.
+    # The close button selector is button.close-button (confirmed from DOM inspection).
+    # If we don't close tabs, the CRM reuses the open tab instead of rendering fresh,
+    # so Image Manager never appears for subsequent units.
+    try:
+        close_btns = page.locator("button.close-button")
+        count = close_btns.count()
+        for j in range(count):
+            try:
+                close_btns.nth(j).click(timeout=2_000)
+                page.wait_for_timeout(200)
+            except Exception:
+                # If one tab fails to close, skip it and continue with others
+                continue
+        if count > 0:
+            print(f"   ✓ Closed {count} detail tab(s)")
+    except Exception:
+        # Tab close is not critical, just log and continue
+        pass
+
+    page.wait_for_timeout(500)
+    print("   ✓ Back to list")
+
+# ═══════════════════════════════════════════════════════════════════
 #  PRICE LOGIC
 # ═══════════════════════════════════════════════════════════════════
 def decide_price(page: Page) -> str:
@@ -676,28 +747,7 @@ def step_publish(page: Page, n_images: int):
         page.wait_for_timeout(3000)
 
     # ── Go back to list ────────────────────────────────────────────
-    print("   ↩ Going back to list page...")
-    page.locator("button, a", has_text=re.compile(r"\bBack\b", re.IGNORECASE)).first.click(timeout=5_000)
-    page.wait_for_load_state("networkidle", timeout=15_000)
-    page.wait_for_timeout(500)
-
-    # Close any open detail tabs so the next card always opens fresh.
-    # The close button selector is button.close-button (confirmed from DOM inspection).
-    # If we don't close tabs, the CRM reuses the open tab instead of rendering fresh,
-    # so Image Manager never appears for subsequent units.
-    try:
-        close_btns = page.locator("button.close-button")
-        count = close_btns.count()
-        for j in range(count):
-            close_btns.nth(j).click()
-            page.wait_for_timeout(200)
-        if count > 0:
-            print(f"   ✓ Closed {count} detail tab(s)")
-    except Exception as e:
-        print(f"   ↳ Could not close detail tab: {e}")
-
-    page.wait_for_timeout(500)
-    print("   ✓ Back to list")
+    go_back_to_list(page)
 
 # ═══════════════════════════════════════════════════════════════════
 #  PROCESS ONE UNIT
@@ -713,8 +763,23 @@ def process_unit(page: Page, url: str, name: str, mapping: dict, state: UploadEr
     if url:
         page.goto(url)
         page.wait_for_load_state("networkidle")
-    actual_count = step_upload_images(page, mapping[utype], utype, state, mapping)
-    step_publish(page, n_images=actual_count)
+    
+    # ── Check if unit is already published ──────────────────────────
+    publish_status = check_publish_status(page)
+    
+    if publish_status == "red":
+        # Not published — proceed normally with upload and publish
+        print("   ↳ Status: Not published (RED) — proceeding normally with upload & publish")
+        actual_count = step_upload_images(page, mapping[utype], utype, state, mapping)
+        step_publish(page, n_images=actual_count)
+    elif publish_status == "disabled":
+        # Button is disabled (e.g., duplicate unit) — skip to next unit
+        print(f"   ↳ Status: Cannot publish (DISABLED) — skipping to next unit")
+        go_back_to_list(page)
+    else:
+        # Already published (green or faded) — skip to next unit
+        print(f"   ↳ Status: Already published ({publish_status.upper()}) — skipping to next unit")
+        go_back_to_list(page)
 
 # ═══════════════════════════════════════════════════════════════════
 #  PROCESS CURRENT PAGE  (only what's loaded right now)
