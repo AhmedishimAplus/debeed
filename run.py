@@ -440,13 +440,16 @@ def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErr
                     actual_count = len(successful_paths)
                     print(f"   ✓ Pool updated to {actual_count} image(s), won't ask again for '{unit_type}'")
                     # Close upload modal and continue normally
-                    try:
-                        page.locator(f"{UPLOAD} .btn-modal-close").click()
-                        page.locator(UPLOAD).wait_for(state="hidden", timeout=5_000)
-                        print("   ✓ Upload modal closed")
-                    except Exception as e:
-                        print(f"   ⚠ Modal close timeout: {e} — continuing")
-                        page.wait_for_timeout(500)
+                    if page.locator(UPLOAD).is_visible():
+                        try:
+                            page.locator(f"{UPLOAD} .btn-modal-close").click()
+                            page.locator(UPLOAD).wait_for(state="hidden", timeout=5_000)
+                            print("   ✓ Upload modal closed")
+                        except Exception as e:
+                            print(f"   ⚠ Modal close timeout: {e} — continuing")
+                            page.wait_for_timeout(500)
+                    else:
+                        print("   ℹ Upload modal already closed")
                 else:
                     # User is NOT OK — show faulty paths, wait, ask for new folder
                     try:
@@ -488,6 +491,19 @@ def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErr
                 mapping[unit_type] = successful_paths
                 actual_count = len(successful_paths)
                 print(f"   ℹ Already acknowledged for '{unit_type}' — omitting {n_failed} failed image(s), using {actual_count}")
+                if page.locator(UPLOAD).is_visible():
+                    try:
+                        page.locator(f"{UPLOAD} .btn-modal-close").click()
+                        page.locator(UPLOAD).wait_for(state="hidden", timeout=5_000)
+                        print("   ✓ Upload modal closed")
+                    except Exception as e:
+                        print(f"   ⚠ Modal close timeout: {e} — continuing")
+                        page.wait_for_timeout(500)
+                else:
+                    print("   ℹ Upload modal already closed")
+        else:
+            print("   ✓ All images uploaded successfully")
+            if page.locator(UPLOAD).is_visible():
                 try:
                     page.locator(f"{UPLOAD} .btn-modal-close").click()
                     page.locator(UPLOAD).wait_for(state="hidden", timeout=5_000)
@@ -495,34 +511,25 @@ def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErr
                 except Exception as e:
                     print(f"   ⚠ Modal close timeout: {e} — continuing")
                     page.wait_for_timeout(500)
-        else:
-            print("   ✓ All images uploaded successfully")
-            try:
-                page.locator(f"{UPLOAD} .btn-modal-close").click()
-                page.locator(UPLOAD).wait_for(state="hidden", timeout=5_000)
-                print("   ✓ Upload modal closed")
-            except Exception as e:
-                print(f"   ⚠ Modal close timeout: {e} — continuing")
-                page.wait_for_timeout(500)
+            else:
+                print("   ℹ Upload modal already closed")
 
         state.mark_uploaded(unit_type)
 
     else:
         # Not first upload for this type — close immediately, no check
         print("   ℹ Not first upload for this type — closing without error check")
-        try:
-            page.locator(f"{UPLOAD} .btn-modal-close").click()
-            page.locator(UPLOAD).wait_for(state="hidden", timeout=10_000)
-            print("   ✓ Upload modal closed")
-        except Exception as e:
-            print(f"   ⚠ Error closing upload modal: {e} — attempting alternative close...")
+        # Check if upload modal is still open before trying to close
+        if page.locator(UPLOAD).is_visible():
             try:
-                page.press("Escape")
-                page.wait_for_timeout(500)
-                print("   ✓ Closed via Escape")
-            except Exception:
-                print("   ⚠ Could not close modal, attempting to continue anyway")
-                page.wait_for_timeout(1000)
+                page.locator(f"{UPLOAD} .btn-modal-close").click()
+                page.locator(UPLOAD).wait_for(state="hidden", timeout=5_000)
+                print("   ✓ Upload modal closed")
+            except Exception as e:
+                print(f"   ⚠ Could not close modal: {e} — proceeding anyway")
+                page.wait_for_timeout(300)
+        else:
+            print("   ℹ Upload modal already auto-closed, proceeding to tagging…")
 
     # ── Tag newly uploaded images ──────────────────────────────────
     print(f"   ── Tagging as '{IMAGE_TAG}'…")
