@@ -18,7 +18,7 @@ SETUP (one-time):
   Launch Chrome via launch_chrome.bat, log in, navigate to filtered list.
 """
 
-import re, csv
+import re, csv, random
 from pathlib import Path
 from playwright.sync_api import sync_playwright, Page
 
@@ -301,6 +301,10 @@ def decide_price(page: Page) -> str:
 # ═══════════════════════════════════════════════════════════════════
 def step_upload_images(page: Page, paths: list):
     print("\n   ── STEP 1: Image Manager ──")
+    
+    # Randomize image upload order for visual variety
+    random.shuffle(paths)
+    print(f"   ↳ Upload order randomized")
 
     MODAL = ".modal-mask"
 
