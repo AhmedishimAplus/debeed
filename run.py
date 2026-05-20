@@ -625,7 +625,6 @@ def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErr
         tagged += 1
 
     print(f"   ✓ Tagged {tagged} image(s)")
-    confirm("STEP 2 — Tags correct?")  # ← REMOVE FOR AUTO
 
     # ── Save ───────────────────────────────────────────────────────
     save_btn = page.locator(f"{MODAL} button.btn-primary", has_text="Save")
@@ -684,8 +683,6 @@ def step_publish(page: Page, n_images: int):
     dp_final = page.locator(DOWN_PAYMENT_CB).is_checked()
     print(f"   ↳ Final state: Unit Price={up_final}  |  Down Payment={dp_final}")
 
-    confirm("STEP 4 — Price display correct?")  # ← REMOVE FOR AUTO
-
     # ── Switch to Images tab ───────────────────────────────────────
     print("   ── Switching to Images tab…")
     page.locator(f"{MODAL} button", has_text="Images").click()
@@ -709,8 +706,6 @@ def step_publish(page: Page, n_images: int):
             selected += 1
 
     print(f"   ✓ {selected}/{to_select} image(s) selected for publish")
-
-    confirm("STEP 5 — Images selected correctly?")  # ← REMOVE FOR AUTO
 
     # ── Check Published checkbox ───────────────────────────────────
     page.locator(f"{MODAL} button", has_text="Fields").click()
