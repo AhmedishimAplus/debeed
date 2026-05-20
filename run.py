@@ -38,6 +38,46 @@ def confirm(step: str):
     input(f"\n✋  {step}\n   Press Enter to continue... ")
 
 # ═══════════════════════════════════════════════════════════════════
+#  ERROR HANDLING STATE (tracks upload errors per type/globally)
+# ═══════════════════════════════════════════════════════════════════
+class UploadErrorState:
+    def __init__(self, same_images_mode: bool):
+        self.same_images_mode = same_images_mode
+        self.global_acknowledged = False  # For same_images_mode
+        self.acknowledged_types = {}      # For different images per type: {type: True/False}
+        self.first_upload_per_type = {}   # Track if first upload for each type
+
+    def is_first_upload(self, unit_type: str) -> bool:
+        """Check if this is the first upload for this type."""
+        if self.same_images_mode:
+            # For same images mode, only check first time globally
+            return len(self.first_upload_per_type) == 0
+        else:
+            # For different images per type, check first time per type
+            return unit_type not in self.first_upload_per_type
+
+    def mark_uploaded(self, unit_type: str):
+        """Mark that we've done first upload for this type."""
+        if self.same_images_mode:
+            self.first_upload_per_type["global"] = True
+        else:
+            self.first_upload_per_type[unit_type] = True
+
+    def should_ask_user(self, unit_type: str) -> bool:
+        """Determine if user should be asked about the error for this type."""
+        if self.same_images_mode:
+            return not self.global_acknowledged
+        else:
+            return unit_type not in self.acknowledged_types
+
+    def mark_acknowledged(self, unit_type: str):
+        """Mark that user acknowledged error for this type."""
+        if self.same_images_mode:
+            self.global_acknowledged = True
+        else:
+            self.acknowledged_types[unit_type] = True
+
+# ═══════════════════════════════════════════════════════════════════
 #  UNIT TYPE EXTRACTION
 #  "Hyde Park-Hyde park New Cairo-Greens-Apartment" → "Apartment"
 #  "ORA-Solana West-C4-Twin House"                 → "Twin House"
@@ -299,30 +339,21 @@ def decide_price(page: Page) -> str:
 # ═══════════════════════════════════════════════════════════════════
 #  STEP 1 — UPLOAD + TAG IMAGES
 # ═══════════════════════════════════════════════════════════════════
-def step_upload_images(page: Page, paths: list):
+def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErrorState, mapping: dict) -> int:
     print("\n   ── STEP 1: Image Manager ──")
-    
-    # Randomize image upload order for visual variety
+
     random.shuffle(paths)
     print(f"   ↳ Upload order randomized")
 
-    MODAL = ".modal-mask"
+    MODAL  = ".modal-mask"
+    UPLOAD = ".modal.fade.show"
 
-    # ── Open Image Manager ──────────────────────────────────────────
+    # ── Open Image Manager ─────────────────────────────────────────
     print("   ↳ Clicking Image Manager button...")
     page.locator("button", has_text="Image Manager").first.click(timeout=5_000)
-
-    # Wait for the modal container to appear
     page.locator(MODAL).wait_for(state="visible", timeout=15_000)
-
-    # IMPORTANT: the modal does an API fetch for existing images after opening.
-    # Wait until the Upload button is actually rendered before trying to click it.
-    # This is why Image Manager felt "slow" — we were clicking before it was ready.
     try:
-        page.wait_for_selector(
-            f"{MODAL} button.btn-primary",
-            timeout=20_000
-        )
+        page.wait_for_selector(f"{MODAL} button.btn-primary", timeout=20_000)
         print("   ✓ Image Manager loaded")
     except Exception:
         page.wait_for_timeout(2000)
@@ -330,12 +361,9 @@ def step_upload_images(page: Page, paths: list):
 
     # ── Open Upload sub-modal ──────────────────────────────────────
     page.locator(f"{MODAL} button.btn-primary", has_text="Upload").click()
-
-    # Upload sub-modal is a BOOTSTRAP modal — different selector
-    UPLOAD = ".modal.fade.show"
     page.locator(UPLOAD).wait_for(state="visible", timeout=10_000)
 
-    # ── Set files via OS file chooser ─────────────────────────────
+    # ── Set files ──────────────────────────────────────────────────
     with page.expect_file_chooser(timeout=15_000) as fc_info:
         page.locator(f"{UPLOAD} .btn-file-upload").first.click()
     fc_info.value.set_files(paths)
@@ -343,18 +371,161 @@ def step_upload_images(page: Page, paths: list):
 
     # ── Confirm upload ─────────────────────────────────────────────
     page.locator(f"{UPLOAD} .btn-modal-primary").click()
-    page.wait_for_timeout(UPLOAD_WAIT_MS)
 
-    # ── Close upload modal ─────────────────────────────────────────
-    page.locator(f"{UPLOAD} .btn-modal-close").click()
-    page.locator(UPLOAD).wait_for(state="hidden", timeout=10_000)
-    print("   ✓ Upload modal closed")
+    # ── Wait for all rows to show a final status icon ──────────────
+    # The spinner SVG has display:none when done. We wait until every
+    # .file-preview row has either #icon-solid-success or #icon-solid-error.
+    print("   ↳ Waiting for uploads to complete…")
+    try:
+        page.wait_for_function(
+            """() => {
+                const rows = document.querySelectorAll('.file-preview-container .file-preview');
+                // If no rows found, might be different upload state — just return true to proceed
+                if (rows.length === 0) {
+                    // Check if upload is even happening — look for file info anywhere
+                    const hasAnyUploadContent = document.querySelector('.file-preview-container, [class*="upload"], [class*="file"]');
+                    return hasAnyUploadContent ? false : true;  // If no upload UI at all, we're done
+                }
+                // Wait for all rows to have success or error icon
+                for (const row of rows) {
+                    const success = row.querySelector('use[href="#icon-solid-success"]');
+                    const error   = row.querySelector('use[href="#icon-solid-error"]');
+                    if (!success && !error) return false;  // still pending
+                }
+                return true;
+            }""",
+            timeout=60_000
+        )
+        print("   ✓ All uploads settled")
+    except Exception as e:
+        print(f"   ⚠ Timeout waiting for upload results ({e}) — continuing anyway")
+        page.wait_for_timeout(UPLOAD_WAIT_MS)
 
-    confirm("STEP 1 — Verify images appeared in Image Manager.")  # ← REMOVE FOR AUTO
+    # ── Check for errors (ONLY on first upload for this type) ──────
+    is_first = state.is_first_upload(unit_type)
+    actual_count = len(paths)
+
+    if is_first:
+        # Scan every .file-preview row for #icon-solid-error
+        failed_filenames = page.evaluate("""() => {
+            const failed = [];
+            const rows = document.querySelectorAll('.file-preview-container .file-preview');
+            for (const row of rows) {
+                if (row.querySelector('use[href="#icon-solid-error"]')) {
+                    const nameEl = row.querySelector('.file-preview > div:nth-child(2) > div:first-child');
+                    failed.push(nameEl ? nameEl.innerText.trim() : 'unknown');
+                }
+            }
+            return failed;
+        }""")
+
+        if failed_filenames:
+            n_failed  = len(failed_filenames)
+            n_success = len(paths) - n_failed
+            # Map filenames back to full local paths
+            failed_paths = [p for p in paths if Path(p).name in failed_filenames]
+
+            print(f"\n   ⚠ {n_failed} image(s) failed to upload:")
+            for fp in failed_paths:
+                print(f"      → {fp}")
+
+            if state.should_ask_user(unit_type):
+                ans = input(f"\n   ❓ Continue with {n_success} image(s) instead of {len(paths)}? (y/n): ").strip().lower()
+
+                if ans == "y":
+                    # User is OK — omit failed images, update pool, don't ask again
+                    state.mark_acknowledged(unit_type)
+                    successful_paths = [p for p in paths if p not in failed_paths]
+                    mapping[unit_type] = successful_paths
+                    actual_count = len(successful_paths)
+                    print(f"   ✓ Pool updated to {actual_count} image(s), won't ask again for '{unit_type}'")
+                    # Close upload modal and continue normally
+                    try:
+                        page.locator(f"{UPLOAD} .btn-modal-close").click()
+                        page.locator(UPLOAD).wait_for(state="hidden", timeout=5_000)
+                        print("   ✓ Upload modal closed")
+                    except Exception as e:
+                        print(f"   ⚠ Modal close timeout: {e} — continuing")
+                        page.wait_for_timeout(500)
+                else:
+                    # User is NOT OK — show faulty paths, wait, ask for new folder
+                    try:
+                        page.locator(f"{UPLOAD} .btn-modal-close").click()
+                        page.locator(UPLOAD).wait_for(state="hidden", timeout=5_000)
+                    except Exception:
+                        try:
+                            page.press("Escape")
+                            page.wait_for_timeout(300)
+                        except Exception:
+                            pass
+                    # Close Image Manager too so user can go back to list
+                    try:
+                        page.locator(f"{MODAL} button", has_text="Cancel").first.click(timeout=3_000)
+                        page.locator(MODAL).wait_for(state="hidden", timeout=5_000)
+                    except Exception:
+                        pass
+
+                    while True:
+                        print(f"\n   ❌ Faulty image(s) that failed:")
+                        for fp in failed_paths:
+                            print(f"      → {fp}")
+                        print(f"\n   Please go back to the list page and delete the bad images from the folder.")
+                        input(f"   Press Enter when ready to provide a new folder path… ")
+
+                        new_raw = input(f"   New folder path for [{unit_type}]: ").strip().strip('"').strip("'")
+                        try:
+                            new_files = validate_folder(new_raw)
+                            print(f"   ✓ {len(new_files)} image(s) found in new folder")
+                            mapping[unit_type] = new_files
+                            # Retry upload from scratch with new images
+                            print(f"   ↳ Retrying upload with new images…")
+                            return step_upload_images(page, new_files, unit_type, state, mapping)
+                        except FileNotFoundError as e:
+                            print(f"   ✗ {e} — try again")
+            else:
+                # Already acknowledged for this type — silently omit, update pool
+                successful_paths = [p for p in paths if p not in failed_paths]
+                mapping[unit_type] = successful_paths
+                actual_count = len(successful_paths)
+                print(f"   ℹ Already acknowledged for '{unit_type}' — omitting {n_failed} failed image(s), using {actual_count}")
+                try:
+                    page.locator(f"{UPLOAD} .btn-modal-close").click()
+                    page.locator(UPLOAD).wait_for(state="hidden", timeout=5_000)
+                    print("   ✓ Upload modal closed")
+                except Exception as e:
+                    print(f"   ⚠ Modal close timeout: {e} — continuing")
+                    page.wait_for_timeout(500)
+        else:
+            print("   ✓ All images uploaded successfully")
+            try:
+                page.locator(f"{UPLOAD} .btn-modal-close").click()
+                page.locator(UPLOAD).wait_for(state="hidden", timeout=5_000)
+                print("   ✓ Upload modal closed")
+            except Exception as e:
+                print(f"   ⚠ Modal close timeout: {e} — continuing")
+                page.wait_for_timeout(500)
+
+        state.mark_uploaded(unit_type)
+
+    else:
+        # Not first upload for this type — close immediately, no check
+        print("   ℹ Not first upload for this type — closing without error check")
+        try:
+            page.locator(f"{UPLOAD} .btn-modal-close").click()
+            page.locator(UPLOAD).wait_for(state="hidden", timeout=10_000)
+            print("   ✓ Upload modal closed")
+        except Exception as e:
+            print(f"   ⚠ Error closing upload modal: {e} — attempting alternative close...")
+            try:
+                page.press("Escape")
+                page.wait_for_timeout(500)
+                print("   ✓ Closed via Escape")
+            except Exception:
+                print("   ⚠ Could not close modal, attempting to continue anyway")
+                page.wait_for_timeout(1000)
 
     # ── Tag newly uploaded images ──────────────────────────────────
     print(f"   ── Tagging as '{IMAGE_TAG}'…")
-
     img_cols = page.locator(f"{MODAL} .col-6.col-md-3.col-lg-3.py-2")
     col_count = img_cols.count()
     tagged = 0
@@ -384,6 +555,8 @@ def step_upload_images(page: Page, paths: list):
     save_btn.click()
     page.locator(MODAL).wait_for(state="hidden", timeout=10_000)
     print("   ✓ Saved")
+
+    return actual_count
 
 # ═══════════════════════════════════════════════════════════════════
 #  STEP 2 — PUBLISH UNIT (CLIENTS)
@@ -522,7 +695,7 @@ def step_publish(page: Page, n_images: int):
 # ═══════════════════════════════════════════════════════════════════
 #  PROCESS ONE UNIT
 # ═══════════════════════════════════════════════════════════════════
-def process_unit(page: Page, url: str, name: str, mapping: dict):
+def process_unit(page: Page, url: str, name: str, mapping: dict, state: UploadErrorState):
     utype = extract_type(name)
     if utype not in mapping:
         raise KeyError(
@@ -533,13 +706,13 @@ def process_unit(page: Page, url: str, name: str, mapping: dict):
     if url:
         page.goto(url)
         page.wait_for_load_state("networkidle")
-    step_upload_images(page, mapping[utype])
-    step_publish(page, n_images=len(mapping[utype]))
+    actual_count = step_upload_images(page, mapping[utype], utype, state, mapping)
+    step_publish(page, n_images=actual_count)
 
 # ═══════════════════════════════════════════════════════════════════
 #  PROCESS CURRENT PAGE  (only what's loaded right now)
 # ═══════════════════════════════════════════════════════════════════
-def process_current_page(page: Page, mapping: dict, page_num: int, results: list):
+def process_current_page(page: Page, mapping: dict, page_num: int, results: list, state: UploadErrorState):
     list_url = page.url
 
     links = page.locator("a[href*='/resale-unit/'], a[href*='realestate-workspace/resale-unit/']").all()
@@ -568,7 +741,7 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
         for i, (name, url) in enumerate(unit_data, 1):
             print(f"\n  [{i}/{len(unit_data)}]  {name}")
             try:
-                process_unit(page, url, name, mapping)
+                process_unit(page, url, name, mapping, state)
                 results.append({"page": page_num, "unit": name, "url": url, "status": "OK"})
                 print("  ✅ Done")
             except Exception as e:
@@ -652,7 +825,7 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
             page.wait_for_selector("button:has-text('Image Manager')", state="visible", timeout=15_000)
 
             print(f"   ✓ Opened detail page")
-            process_unit(page, None, name, mapping)
+            process_unit(page, None, name, mapping, state)
             results.append({"page": page_num, "unit": name, "url": page.url, "status": "OK"})
             print("  ✅ Done")
         except Exception as e:
@@ -694,11 +867,18 @@ def main():
             print("\n  Cancelled.")
             return
 
+        # Determine if using same images for all types or different per type
+        same_images_mode = all(
+            mapping[types[0]] == mapping[t] for t in types
+        ) if len(types) > 0 else False
+        state = UploadErrorState(same_images_mode=same_images_mode)
+        print(f"   Image mode: {'Same for all types' if same_images_mode else 'Different per type'}")
+
         results  = []
         page_num = 1
 
         while True:
-            process_current_page(page, mapping, page_num, results)
+            process_current_page(page, mapping, page_num, results, state)
 
             pg_ok   = sum(1 for r in results if r["page"] == page_num and r["status"] == "OK")
             pg_fail = sum(1 for r in results if r["page"] == page_num and r["status"] != "OK")
