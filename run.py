@@ -1,0 +1,735 @@
+"""
+EGY Property — Resale Unit Automation
+======================================
+Flow:
+  1. Connect to your open Chrome session
+  2. Script scans current page → finds all unit types
+  3. Asks you for image folder paths (same for all, or per type)
+  4. Processes every unit on the page
+  5. Prompts you to advance to next page manually → repeat until done
+
+REMOVING CONFIRMATIONS (go full-auto later):
+  Search "# ← REMOVE FOR AUTO" and delete those lines.
+  Keep STEP 5 (Images tab) until that part of the DOM is mapped.
+
+SETUP (one-time):
+  pip install playwright
+  playwright install chromium
+  Launch Chrome via launch_chrome.bat, log in, navigate to filtered list.
+"""
+
+import re, csv
+from pathlib import Path
+from playwright.sync_api import sync_playwright, Page
+
+# ═══════════════════════════════════════════════════════════════════
+#  SETTINGS
+# ═══════════════════════════════════════════════════════════════════
+BASE_URL       = "https://team.egyproperty-eg.com"
+PRICE_MODE     = "auto"     # "auto" | "down_payment" | "unit_price"
+DP_THRESHOLD   = 80.0       # auto: if DP > this % of price → use Unit Price (0 or >80% = Unit Price)
+IMAGE_TAG      = "Live Photo"
+UPLOAD_WAIT_MS = 3500
+
+# ═══════════════════════════════════════════════════════════════════
+#  CONFIRMATION  ← delete all confirm() calls to go auto
+# ═══════════════════════════════════════════════════════════════════
+def confirm(step: str):
+    input(f"\n✋  {step}\n   Press Enter to continue... ")
+
+# ═══════════════════════════════════════════════════════════════════
+#  UNIT TYPE EXTRACTION
+#  "Hyde Park-Hyde park New Cairo-Greens-Apartment" → "Apartment"
+#  "ORA-Solana West-C4-Twin House"                 → "Twin House"
+# ═══════════════════════════════════════════════════════════════════
+def extract_type(unit_name: str) -> str:
+    parts = unit_name.split("-")
+    return parts[-1].strip() if parts else unit_name.strip()
+
+def extract_unit_names_from_text(page: Page) -> list:
+    """Extract visible unit names from the list page text.
+    This is a fallback for pages where unit cards are not anchor tags.
+    """
+    body_text = page.locator("body").inner_text()
+    lines = body_text.split("\n")
+
+    names = []
+    skip_tokens = [
+        "refresh", "last update", "price", "payment", "no. of", "bua",
+        "installments", "press enter", "debug", "available", "sold-out",
+        "select all", "total:", "clear duplicates", "published by", "cash"
+    ]
+
+    for raw in lines:
+        line = raw.strip()
+        if not line or len(line) < 10 or line.count("-") < 2:
+            continue
+        if any(tok in line.lower() for tok in skip_tokens):
+            continue
+        names.append(line)
+
+    return names
+
+def extract_unit_cards_from_text(page: Page) -> list:
+    """Extract ordered card records from list-page text.
+    Each record keeps the unit name plus lightweight fingerprint fields
+    (last update and price hint) to disambiguate duplicate names.
+    """
+    body_text = page.locator("body").inner_text()
+    lines = [ln.strip() for ln in body_text.split("\n") if ln.strip()]
+
+    skip_tokens = [
+        "refresh", "press enter", "debug", "select all", "clear duplicates",
+        "published by", "filters", "collapse", "total:"
+    ]
+
+    def looks_like_name(line: str) -> bool:
+        if len(line) < 10 or line.count("-") < 2:
+            return False
+        low = line.lower()
+        if any(tok in low for tok in skip_tokens):
+            return False
+        if "last update" in low or "bua" in low or "bedroom" in low:
+            return False
+        return True
+
+    cards = []
+    current = None
+
+    for line in lines:
+        if looks_like_name(line):
+            if current:
+                cards.append(current)
+            current = {"name": line, "last_update": "", "price_hint": ""}
+            continue
+
+        if not current:
+            continue
+
+        if "last update date" in line.lower():
+            current["last_update"] = line
+            continue
+
+        if not current["price_hint"] and line.upper().startswith("EGP"):
+            current["price_hint"] = line
+
+    if current:
+        cards.append(current)
+
+    return cards
+
+# ═══════════════════════════════════════════════════════════════════
+#  SCAN PAGE → UNIQUE UNIT TYPES
+# ═══════════════════════════════════════════════════════════════════
+def scan_unit_types(page: Page) -> list:
+    page.wait_for_load_state("networkidle", timeout=10_000)
+    page.wait_for_timeout(500)
+
+    print(f"   DEBUG: Scanning for unit cards...")
+
+    unit_names = extract_unit_names_from_text(page)
+
+    types = []
+    seen = set()
+
+    for line in unit_names:
+        t = extract_type(line)
+        if t and t not in seen and len(t) > 2 and not any(c.isdigit() for c in t[:3]):
+            seen.add(t)
+            types.append(t)
+            print(f"   DEBUG: Found type from line: '{line[:70]}...' → Type: '{t}'")
+
+    print(f"   DEBUG: Extracted types: {types}")
+    return types
+
+# ═══════════════════════════════════════════════════════════════════
+#  COLLECT IMAGE PATHS FROM USER
+# ═══════════════════════════════════════════════════════════════════
+def clean_path(raw: str) -> str:
+    return raw.strip().strip('"').strip("'")
+
+def validate_folder(folder: str) -> list:
+    p = Path(folder)
+    if not p.is_dir():
+        raise FileNotFoundError(f"Folder not found: {folder}")
+    exts  = {".jpg", ".jpeg", ".png", ".webp"}
+    files = sorted(str(f) for f in p.iterdir() if f.suffix.lower() in exts)
+    if not files:
+        raise FileNotFoundError(f"No images in: {folder}")
+    return files
+
+def collect_image_mapping(types: list) -> dict:
+    print(f"\n{'─'*50}")
+    print(f"  Found {len(types)} type(s):  {',  '.join(types)}")
+    print(f"{'─'*50}")
+
+    while True:
+        choice = input("\n  Same images for ALL types? (y/n): ").strip().lower()
+        if choice in ("y", "n"):
+            break
+        print("  Enter y or n.")
+
+    mapping = {}
+
+    if choice == "y":
+        while True:
+            try:
+                files = validate_folder(clean_path(input("\n  Folder path (all types): ")))
+                print(f"  ✓ {len(files)} image(s) found")
+                for t in types:
+                    mapping[t] = files
+                break
+            except FileNotFoundError as e:
+                print(f"  ✗ {e} — try again")
+    else:
+        for t in types:
+            while True:
+                try:
+                    files = validate_folder(clean_path(input(f"\n  Folder path for  [{t}]: ")))
+                    print(f"  ✓ {len(files)} image(s) found")
+                    mapping[t] = files
+                    break
+                except FileNotFoundError as e:
+                    print(f"  ✗ {e} — try again")
+
+    return mapping
+
+def confirm_mapping(mapping: dict) -> bool:
+    print(f"\n{'═'*50}")
+    print("  IMAGE MAPPING SUMMARY")
+    print(f"{'─'*50}")
+    for t, files in mapping.items():
+        folder = str(Path(files[0]).parent) if files else "—"
+        print(f"  {t:<20} →  {len(files)} image(s)")
+        print(f"  {'':20}    {folder}")
+    print(f"{'═'*50}")
+    while True:
+        ans = input("\n  Look good? Start? (y/n): ").strip().lower()
+        if ans == "y": return True
+        if ans == "n": return False
+        print("  Enter y or n.")
+
+# ═══════════════════════════════════════════════════════════════════
+#  PRICE LOGIC
+# ═══════════════════════════════════════════════════════════════════
+def decide_price(page: Page) -> str:
+    if PRICE_MODE == "down_payment":
+        print("   ↳ PRICE_MODE override: down_payment")
+        return "down_payment"
+    if PRICE_MODE == "unit_price":
+        print("   ↳ PRICE_MODE override: unit_price")
+        return "unit_price"
+
+    try:
+        MODAL = ".modal-mask"
+        page.wait_for_selector(MODAL, state="visible", timeout=8000)
+
+        # Values are inside readonly <input> elements — innerText misses them.
+        # We must read .value via JavaScript directly from the DOM inputs.
+        # Wait until Unit Price input has a non-empty value (confirms Vue rendered).
+        try:
+            page.wait_for_function(
+                """() => {
+                    const blocks = document.querySelectorAll('.modal-mask .field-block');
+                    for (const block of blocks) {
+                        const label = block.querySelector('.field-label');
+                        const input = block.querySelector('input.readonly-input');
+                        if (label && input && label.innerText.trim() === 'Unit Price' && input.value.trim() !== '') {
+                            return true;
+                        }
+                    }
+                    return false;
+                }""",
+                timeout=8000
+            )
+            print("   ↳ Modal field values confirmed loaded")
+        except Exception:
+            print("   ↳ ⚠ Timed out waiting for field values — proceeding anyway")
+
+        # Extract all field label→value pairs from the modal using JS
+        # because values live in readonly inputs, not in innerText
+        field_map = page.evaluate("""() => {
+            const result = {};
+            const blocks = document.querySelectorAll('.modal-mask .field-block');
+            for (const block of blocks) {
+                const label = block.querySelector('.field-label');
+                const input = block.querySelector('input.readonly-input');
+                if (label && input) {
+                    result[label.innerText.trim()] = input.value.trim();
+                }
+            }
+            return result;
+        }""")
+
+        print(f"   ↳ Fields extracted: { {k: v for k, v in field_map.items() if k in ('Unit Price', 'Down Payment', 'Selling Price (EGP)')} }")
+
+        # Get Down Payment value
+        dp_raw = field_map.get("Down Payment", "")
+        # Get Unit Price value (try both possible label names)
+        up_raw = field_map.get("Unit Price", "") or field_map.get("Selling Price (EGP)", "")
+
+        if not dp_raw or not up_raw:
+            print(f"   ↳ ⚠ Could not extract both values (DP='{dp_raw}', UP='{up_raw}'). Defaulting to down_payment.")
+            return "down_payment"
+
+        try:
+            dp = float(re.sub(r"[^\d.]", "", dp_raw))
+            up = float(re.sub(r"[^\d.]", "", up_raw))
+        except ValueError as e:
+            print(f"   ↳ ⚠ Parse error: {e}. Defaulting to down_payment.")
+            return "down_payment"
+
+        ratio = (dp / up * 100) if up > 0 else 0
+        print(f"   ↳ DP={dp:,.0f}  |  UP={up:,.0f}  |  DP is {ratio:.1f}% of UP")
+
+        # Default is down_payment UNLESS:
+        #   - Down Payment is 0, OR
+        #   - Down Payment >= DP_THRESHOLD% of Unit Price
+        if dp == 0 or ratio >= DP_THRESHOLD:
+            print(f"   ↳ Decision: unit_price  (DP=0 or DP≥{DP_THRESHOLD}% of UP)")
+            return "unit_price"
+        else:
+            print(f"   ↳ Decision: down_payment  (DP is {ratio:.1f}% of UP, under {DP_THRESHOLD}%)")
+            return "down_payment"
+
+    except Exception as e:
+        print(f"   ↳ ⚠ decide_price() exception: {e}. Defaulting to down_payment.")
+        return "down_payment"
+
+# ═══════════════════════════════════════════════════════════════════
+#  STEP 1 — UPLOAD + TAG IMAGES
+# ═══════════════════════════════════════════════════════════════════
+def step_upload_images(page: Page, paths: list):
+    print("\n   ── STEP 1: Image Manager ──")
+
+    MODAL = ".modal-mask"
+
+    # ── Open Image Manager ──────────────────────────────────────────
+    print("   ↳ Clicking Image Manager button...")
+    page.locator("button", has_text="Image Manager").first.click(timeout=5_000)
+
+    # Wait for the modal container to appear
+    page.locator(MODAL).wait_for(state="visible", timeout=15_000)
+
+    # IMPORTANT: the modal does an API fetch for existing images after opening.
+    # Wait until the Upload button is actually rendered before trying to click it.
+    # This is why Image Manager felt "slow" — we were clicking before it was ready.
+    try:
+        page.wait_for_selector(
+            f"{MODAL} button.btn-primary",
+            timeout=20_000
+        )
+        print("   ✓ Image Manager loaded")
+    except Exception:
+        page.wait_for_timeout(2000)
+        print("   ✓ Image Manager opened (fallback wait)")
+
+    # ── Open Upload sub-modal ──────────────────────────────────────
+    page.locator(f"{MODAL} button.btn-primary", has_text="Upload").click()
+
+    # Upload sub-modal is a BOOTSTRAP modal — different selector
+    UPLOAD = ".modal.fade.show"
+    page.locator(UPLOAD).wait_for(state="visible", timeout=10_000)
+
+    # ── Set files via OS file chooser ─────────────────────────────
+    with page.expect_file_chooser(timeout=15_000) as fc_info:
+        page.locator(f"{UPLOAD} .btn-file-upload").first.click()
+    fc_info.value.set_files(paths)
+    print(f"   ✓ {len(paths)} file(s) queued via file chooser")
+
+    # ── Confirm upload ─────────────────────────────────────────────
+    page.locator(f"{UPLOAD} .btn-modal-primary").click()
+    page.wait_for_timeout(UPLOAD_WAIT_MS)
+
+    # ── Close upload modal ─────────────────────────────────────────
+    page.locator(f"{UPLOAD} .btn-modal-close").click()
+    page.locator(UPLOAD).wait_for(state="hidden", timeout=10_000)
+    print("   ✓ Upload modal closed")
+
+    confirm("STEP 1 — Verify images appeared in Image Manager.")  # ← REMOVE FOR AUTO
+
+    # ── Tag newly uploaded images ──────────────────────────────────
+    print(f"   ── Tagging as '{IMAGE_TAG}'…")
+
+    img_cols = page.locator(f"{MODAL} .col-6.col-md-3.col-lg-3.py-2")
+    col_count = img_cols.count()
+    tagged = 0
+
+    for i in range(col_count):
+        col = img_cols.nth(i)
+        wrapper = col.locator(".image-wrapper")
+        wrapper_class = wrapper.get_attribute("class") or ""
+        if "faded" in wrapper_class:
+            continue
+        tag_btn = col.locator("button", has_text=IMAGE_TAG)
+        if tag_btn.count() == 0:
+            continue
+        btn_class = tag_btn.get_attribute("class") or ""
+        if "btn-primary" in btn_class:
+            continue
+        tag_btn.click()
+        page.wait_for_timeout(200)
+        tagged += 1
+
+    print(f"   ✓ Tagged {tagged} image(s)")
+    confirm("STEP 2 — Tags correct?")  # ← REMOVE FOR AUTO
+
+    # ── Save ───────────────────────────────────────────────────────
+    save_btn = page.locator(f"{MODAL} button.btn-primary", has_text="Save")
+    save_btn.wait_for(state="visible", timeout=10_000)
+    save_btn.click()
+    page.locator(MODAL).wait_for(state="hidden", timeout=10_000)
+    print("   ✓ Saved")
+
+# ═══════════════════════════════════════════════════════════════════
+#  STEP 2 — PUBLISH UNIT (CLIENTS)
+# ═══════════════════════════════════════════════════════════════════
+def step_publish(page: Page, n_images: int):
+    """
+    n_images: number of images just uploaded — select this many newest images.
+    """
+    print("\n   ── STEP 2: Publish Unit ──")
+
+    MODAL = ".modal-mask"
+
+    # ── Open modal ─────────────────────────────────────────────────
+    print("   ↳ Opening Publish Unit (Clients) modal...")
+    page.locator("button", has_text="Publish Unit (Clients)").first.click(timeout=3_000)
+    page.locator(MODAL).wait_for(state="visible", timeout=12_000)
+    page.wait_for_selector("text=Price Display", timeout=10_000)
+    print("   ✓ Modal open")
+
+    # ── Price display (Fields tab is default) ──────────────────────
+    UNIT_PRICE_CB   = f"{MODAL} label.price-display__option:first-child input[type='checkbox']"
+    DOWN_PAYMENT_CB = f"{MODAL} label.price-display__option:last-child input[type='checkbox']"
+
+    choice = decide_price(page)
+    print(f"   ↳ Choice made: {choice}")
+
+    up_checked = page.locator(UNIT_PRICE_CB).is_checked()
+    dp_checked = page.locator(DOWN_PAYMENT_CB).is_checked()
+    print(f"   ↳ Current state: Unit Price={up_checked}  |  Down Payment={dp_checked}")
+
+    if choice == "down_payment":
+        print(f"   ↳ Setting to: Down Payment")
+        if page.locator(UNIT_PRICE_CB).is_checked():
+            page.locator(UNIT_PRICE_CB).click()
+            page.wait_for_timeout(200)
+        if not page.locator(DOWN_PAYMENT_CB).is_checked():
+            page.locator(DOWN_PAYMENT_CB).click()
+    else:
+        print(f"   ↳ Setting to: Unit Price")
+        if page.locator(DOWN_PAYMENT_CB).is_checked():
+            page.locator(DOWN_PAYMENT_CB).click()
+            page.wait_for_timeout(200)
+        if not page.locator(UNIT_PRICE_CB).is_checked():
+            page.locator(UNIT_PRICE_CB).click()
+
+    up_final = page.locator(UNIT_PRICE_CB).is_checked()
+    dp_final = page.locator(DOWN_PAYMENT_CB).is_checked()
+    print(f"   ↳ Final state: Unit Price={up_final}  |  Down Payment={dp_final}")
+
+    confirm("STEP 4 — Price display correct?")  # ← REMOVE FOR AUTO
+
+    # ── Switch to Images tab ───────────────────────────────────────
+    print("   ── Switching to Images tab…")
+    page.locator(f"{MODAL} button", has_text="Images").click()
+    page.wait_for_timeout(800)
+
+    # ── Select the N newest images ─────────────────────────────────
+    img_cols = page.locator(f"{MODAL} .col-6.col-md-3.col-lg-3.py-2")
+    col_count = img_cols.count()
+    to_select = min(n_images, col_count)
+    selected = 0
+
+    for i in range(to_select):
+        col = img_cols.nth(i)
+        wrapper = col.locator(".image-wrapper")
+        wrapper_class = wrapper.get_attribute("class") or ""
+        if "faded" in wrapper_class:
+            wrapper.click()
+            page.wait_for_timeout(150)
+            selected += 1
+        else:
+            selected += 1
+
+    print(f"   ✓ {selected}/{to_select} image(s) selected for publish")
+
+    confirm("STEP 5 — Images selected correctly?")  # ← REMOVE FOR AUTO
+
+    # ── Check Published checkbox ───────────────────────────────────
+    page.locator(f"{MODAL} button", has_text="Fields").click()
+    page.wait_for_timeout(500)
+
+    try:
+        published_cb = page.locator(f"{MODAL}").get_by_text("Published", exact=False).last.locator("ancestor::label input[type='checkbox']")
+        if not published_cb.is_checked():
+            published_cb.check()
+            page.wait_for_timeout(200)
+            print("   ✓ Published checkbox enabled")
+    except Exception:
+        try:
+            published_cb = page.locator(f"{MODAL} input[type='checkbox']").last
+            if not published_cb.is_checked():
+                published_cb.check()
+                page.wait_for_timeout(200)
+                print("   ✓ Published checkbox enabled")
+        except Exception as e:
+            print(f"   ⚠ Could not find Published checkbox: {e}")
+
+    # ── Save ───────────────────────────────────────────────────────
+    page.locator(f"{MODAL} button", has_text="Save").click()
+    print("   ✓ Save clicked")
+
+    # Wait for modal to CLOSE — confirms save completed.
+    # Much better than a flat 10s wait: fast saves proceed immediately,
+    # slow saves are waited on properly up to 15s.
+    try:
+        page.locator(MODAL).wait_for(state="hidden", timeout=15_000)
+        print("   ✓ Modal closed — save confirmed")
+    except Exception:
+        print("   ⚠ Modal did not close in 15s — continuing anyway")
+        page.wait_for_timeout(3000)
+
+    # ── Go back to list ────────────────────────────────────────────
+    print("   ↩ Going back to list page...")
+    page.locator("button, a", has_text=re.compile(r"\bBack\b", re.IGNORECASE)).first.click(timeout=5_000)
+    page.wait_for_load_state("networkidle", timeout=15_000)
+    page.wait_for_timeout(500)
+
+    # Close any open detail tabs so the next card always opens fresh.
+    # The close button selector is button.close-button (confirmed from DOM inspection).
+    # If we don't close tabs, the CRM reuses the open tab instead of rendering fresh,
+    # so Image Manager never appears for subsequent units.
+    try:
+        close_btns = page.locator("button.close-button")
+        count = close_btns.count()
+        for j in range(count):
+            close_btns.nth(j).click()
+            page.wait_for_timeout(200)
+        if count > 0:
+            print(f"   ✓ Closed {count} detail tab(s)")
+    except Exception as e:
+        print(f"   ↳ Could not close detail tab: {e}")
+
+    page.wait_for_timeout(500)
+    print("   ✓ Back to list")
+
+# ═══════════════════════════════════════════════════════════════════
+#  PROCESS ONE UNIT
+# ═══════════════════════════════════════════════════════════════════
+def process_unit(page: Page, url: str, name: str, mapping: dict):
+    utype = extract_type(name)
+    if utype not in mapping:
+        raise KeyError(
+            f"Type '{utype}' has no images assigned. "
+            f"Available: {list(mapping.keys())}"
+        )
+    print(f"   Type: {utype}  |  {len(mapping[utype])} image(s)")
+    if url:
+        page.goto(url)
+        page.wait_for_load_state("networkidle")
+    step_upload_images(page, mapping[utype])
+    step_publish(page, n_images=len(mapping[utype]))
+
+# ═══════════════════════════════════════════════════════════════════
+#  PROCESS CURRENT PAGE  (only what's loaded right now)
+# ═══════════════════════════════════════════════════════════════════
+def process_current_page(page: Page, mapping: dict, page_num: int, results: list):
+    list_url = page.url
+
+    links = page.locator("a[href*='/resale-unit/'], a[href*='realestate-workspace/resale-unit/']").all()
+    hrefs = list(dict.fromkeys(
+        a.get_attribute("href") for a in links if a.get_attribute("href")
+    ))
+
+    hrefs = [h for h in hrefs if h and "realestate-workspace/resale-unit?" not in h and not h.endswith("/resale-unit")]
+
+    if hrefs:
+        print(f"\n  📄 Page {page_num}  —  {len(hrefs)} unit(s)")
+        print(f"{'─'*50}")
+
+        unit_data = []
+        for href in hrefs:
+            link_el = page.locator(f"a[href='{href}']").first
+            name = link_el.inner_text().strip()
+            if not name:
+                try:
+                    name = link_el.locator("h2, h3, [class*='title']").first.inner_text().strip()
+                except Exception:
+                    name = href.split("/")[-1]
+            url = href if href.startswith("http") else BASE_URL + href
+            unit_data.append((name, url))
+
+        for i, (name, url) in enumerate(unit_data, 1):
+            print(f"\n  [{i}/{len(unit_data)}]  {name}")
+            try:
+                process_unit(page, url, name, mapping)
+                results.append({"page": page_num, "unit": name, "url": url, "status": "OK"})
+                print("  ✅ Done")
+            except Exception as e:
+                print(f"  ✗ ERROR: {e}")
+                results.append({"page": page_num, "unit": name, "url": url, "status": f"FAILED: {e}"})
+                input("  ⚠ Fix manually if needed, then press Enter to continue… ")
+
+        return
+
+    # Fallback path: loop DOM cards directly by position.
+    # We do NOT use a text-extracted name list because the page body contains
+    # each unit name twice (tab header + card), creating phantom duplicates
+    # that shift all indexes and cause every unit after the first to click
+    # the wrong card. By reading the name FROM the card we are about to click,
+    # the name and the click target are always the same element — no drift,
+    # no mismatch, duplicate names are handled correctly.
+    card_selector = "div.card.cursor-pointer.rounded-0"
+    cards = page.locator(card_selector)
+    total_cards = cards.count()
+
+    if total_cards == 0:
+        print("  ⚠ No unit cards found in DOM. Are you on the list page?")
+        return
+
+    print(f"\n  📄 Page {page_num}  —  {total_cards} unit(s) [DOM cards]")
+    print(f"{'─'*50}")
+
+    for i in range(total_cards):
+        card_el = cards.nth(i)
+
+        # Read the name directly from the card element
+        try:
+            name = card_el.inner_text().split("\n")[0].strip()
+        except Exception:
+            name = f"Unit {i + 1}"
+
+        print(f"\n  [{i + 1}/{total_cards}]  {name}")
+        try:
+            # PRE-CLICK DIAGNOSTICS
+            print(f"   [DEBUG] Total cards available: {cards.count()}")
+            print(f"   [DEBUG] Current URL: {page.url}")
+            print(f"   [DEBUG] Targeting card #{i}: {name}")
+            
+            # Verify the card we're about to click is valid
+            card_rect = card_el.bounding_box()
+            if card_rect:
+                print(f"   [DEBUG] Card position - X:{card_rect['x']:.0f} Y:{card_rect['y']:.0f} W:{card_rect['width']:.0f} H:{card_rect['height']:.0f}")
+            
+            # Make sure we are on the list page before clicking
+            if "RESALE-" in page.url:
+                page.wait_for_load_state("networkidle")
+
+            card_el.scroll_into_view_if_needed()
+            print(f"   [DEBUG] Click executing...")
+            card_el.click(timeout=5_000)
+            print(f"   [DEBUG] Click executed - waiting for navigation...")
+            page.wait_for_load_state("networkidle", timeout=15_000)
+
+            # POST-CLICK DIAGNOSTICS
+            print(f"   [DEBUG] After click - New URL: {page.url}")
+            print(f"   [DEBUG] Page title: {page.title()}")
+            
+            # Check page content before looking for button
+            try:
+                detail_indicators = page.locator("h1, h2, [class*='title'], [class*='heading']").first.inner_text() if page.locator("h1, h2, [class*='title'], [class*='heading']").count() > 0 else "N/A"
+                print(f"   [DEBUG] Page heading detected: {detail_indicators}")
+            except Exception:
+                print(f"   [DEBUG] Page heading detection failed")
+            
+            # Check for overlay blocking
+            try:
+                overlay = page.locator("[role='dialog'], .modal, .overlay, [class*='backdrop']").first
+                if overlay.is_visible(timeout=500):
+                    print(f"   [DEBUG] ⚠ Overlay detected after click!")
+            except Exception:
+                pass
+
+            # Wait for Image Manager to fully render.
+            # networkidle fires too early — Vue still needs time to mount buttons.
+            # wait_for_selector polls until visible instead of checking once.
+            page.wait_for_selector("button:has-text('Image Manager')", state="visible", timeout=15_000)
+
+            print(f"   ✓ Opened detail page")
+            process_unit(page, None, name, mapping)
+            results.append({"page": page_num, "unit": name, "url": page.url, "status": "OK"})
+            print("  ✅ Done")
+        except Exception as e:
+            print(f"  ✗ ERROR: {e}")
+            results.append({"page": page_num, "unit": name, "url": page.url, "status": f"FAILED: {e}"})
+            input("  ⚠ Fix manually if needed, then press Enter to continue… ")
+
+# ═══════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════
+def main():
+    print("\n" + "═"*50)
+    print("  EGY Property Automation")
+    print("═"*50)
+
+    with sync_playwright() as p:
+        try:
+            browser = p.chromium.connect_over_cdp("http://localhost:9222")
+        except Exception:
+            print("\n❌  Cannot connect to Chrome.")
+            print("    Launch it first with launch_chrome.bat\n")
+            raise
+
+        ctx  = browser.contexts[0]
+        page = ctx.pages[0]
+        print(f"\n✅  Connected  |  {page.url}")
+        print("\n  → Navigate to the filtered unit list in Chrome")
+        print("  → Set your filters and Available checkbox")
+        input("  → Press Enter when ready… \n")
+
+        print("  Scanning page for unit types…")
+        types = scan_unit_types(page)
+        if not types:
+            print("  ✗ No unit types found. Are you on the list page?")
+            return
+
+        mapping = collect_image_mapping(types)
+        if not confirm_mapping(mapping):
+            print("\n  Cancelled.")
+            return
+
+        results  = []
+        page_num = 1
+
+        while True:
+            process_current_page(page, mapping, page_num, results)
+
+            pg_ok   = sum(1 for r in results if r["page"] == page_num and r["status"] == "OK")
+            pg_fail = sum(1 for r in results if r["page"] == page_num and r["status"] != "OK")
+            print(f"\n{'─'*50}")
+            print(f"  Page {page_num} complete  —  {pg_ok} OK  |  {pg_fail} failed")
+
+            try:
+                indicator = page.locator(
+                    "[class*='pagination'], [class*='page-info'], text=/ \\d"
+                ).first.inner_text().strip()
+                print(f"  Browser shows: {indicator}")
+            except Exception:
+                pass
+
+            print(f"{'─'*50}")
+            print("  Enter  →  I moved to next page, continue")
+            print("  done   →  Finish and save results")
+            ans = input("\n  > ").strip().lower()
+            if ans == "done":
+                break
+
+            page_num += 1
+            page.wait_for_load_state("networkidle")
+
+        with open("results.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["page", "unit", "url", "status"])
+            w.writeheader()
+            w.writerows(results)
+
+        total_ok   = sum(1 for r in results if r["status"] == "OK")
+        total_fail = len(results) - total_ok
+        print(f"\n{'═'*50}")
+        print(f"  ✅  All done!  {total_ok} OK  |  {total_fail} failed")
+        print(f"  📄  results.csv saved")
+        print(f"{'═'*50}\n")
+
+if __name__ == "__main__":
+    main()
