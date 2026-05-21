@@ -78,6 +78,26 @@ Type `done` when all pages are finished.
 
 ---
 
+## Persistent Mapping (NEW in v2)
+
+The script supports two modes for providing image folders. Your initial choice on Page 1 controls behavior for subsequent pages:
+
+- **Same images for ALL types (y):** You provide one folder set on Page 1 and the script will reuse that same set for every unit on every page. The script will *not* rescan subsequent pages or prompt again — pure automation after Page 1.
+- **Different images per type (n):** You provide folders per type on Page 1. On subsequent pages the script *rescans* for unit types and will only prompt you for *new* types that were not previously mapped. Known types are reused silently.
+
+Examples:
+
+1. Same images mode (y):
+  - Page 1: supply folder A → All units on all pages use folder A (no more prompts).
+
+2. Different images mode (n):
+  - Page 1: supply folders for Apartment, Villa
+  - Page 2: scan finds Apartment (saved), Villa (saved), Twinhouse (new) → script asks only for Twinhouse path
+  - Page 3+: any new types detected will be requested once and then remembered
+
+This behavior reduces unnecessary prompts while allowing incremental discovery of new unit types across pages.
+
+
 ## Confirmation steps (test mode)
 
 | Step | What to verify |
