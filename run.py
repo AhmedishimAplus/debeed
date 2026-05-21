@@ -30,6 +30,7 @@ PRICE_MODE     = "auto"     # "auto" | "down_payment" | "unit_price"
 DP_THRESHOLD   = 80.0       # auto: if DP > this % of price → use Unit Price (0 or >80% = Unit Price)
 IMAGE_TAG      = "Live Photo"
 UPLOAD_WAIT_MS = 3500
+SLOW_TIMEOUT   = 300_000    # 5 minutes - used for unpredictable slow CRM responses
 
 # ═══════════════════════════════════════════════════════════════════
 #  CONFIRMATION  ← delete all confirm() calls to go auto
@@ -162,8 +163,8 @@ def extract_unit_cards_from_text(page: Page) -> list:
 #  SCAN PAGE → UNIQUE UNIT TYPES
 # ═══════════════════════════════════════════════════════════════════
 def scan_unit_types(page: Page) -> list:
-    page.wait_for_load_state("networkidle", timeout=10_000)
-    page.wait_for_timeout(500)
+    page.wait_for_load_state("networkidle", timeout=SLOW_TIMEOUT)
+    page.wait_for_selector("div.card.cursor-pointer.rounded-0", timeout=SLOW_TIMEOUT)
 
     print(f"   DEBUG: Scanning for unit cards...")
 
@@ -310,7 +311,7 @@ def check_publish_status(page: Page) -> str:
     try:
         # Use .first to avoid strict mode violation when multiple tabs are open
         btn = page.locator('button:has-text("Publish Unit (Clients)")').first
-        btn.wait_for(state="visible", timeout=5000)
+        btn.wait_for(state="visible", timeout=SLOW_TIMEOUT)
         
         # Check if button is disabled (e.g., duplicate unit already published)
         if not btn.is_enabled():
@@ -319,7 +320,7 @@ def check_publish_status(page: Page) -> str:
             return "disabled"
         
         dot = btn.locator('span.dot').first
-        dot.wait_for(state="visible", timeout=5000)
+        dot.wait_for(state="visible", timeout=SLOW_TIMEOUT)
         
         bg_color = dot.evaluate("el => window.getComputedStyle(el).backgroundColor")
         
@@ -344,12 +345,12 @@ def go_back_to_list(page: Page):
     print("   ↩ Going back to list page...")
     # Wait for any freeze overlay to disappear first (may take time on slow systems)
     try:
-        page.wait_for_selector(".freeze-message-container", state="hidden", timeout=30_000)
+        page.wait_for_selector(".freeze-message-container", state="hidden", timeout=SLOW_TIMEOUT)
     except Exception:
         pass  # Overlay might not exist, continue anyway
-    page.locator("button, a", has_text=re.compile(r"\bBack\b", re.IGNORECASE)).first.click(timeout=10_000)
-    page.wait_for_load_state("networkidle", timeout=30_000)
-    page.wait_for_timeout(1000)
+    page.locator("button, a", has_text=re.compile(r"\bBack\b", re.IGNORECASE)).first.click(timeout=SLOW_TIMEOUT)
+    page.wait_for_load_state("networkidle", timeout=SLOW_TIMEOUT)
+    page.wait_for_selector("div.card.cursor-pointer.rounded-0", timeout=SLOW_TIMEOUT)
 
     # Close any open detail tabs so the next card always opens fresh.
     # The close button selector is button.close-button (confirmed from DOM inspection).
@@ -360,8 +361,8 @@ def go_back_to_list(page: Page):
         count = close_btns.count()
         for j in range(count):
             try:
-                close_btns.nth(j).click(timeout=2_000)
-                page.wait_for_timeout(200)
+                close_btns.nth(j).click(timeout=SLOW_TIMEOUT)
+                page.wait_for_selector("button.close-button", state="hidden", timeout=SLOW_TIMEOUT)
             except Exception:
                 # If one tab fails to close, skip it and continue with others
                 continue
@@ -371,7 +372,7 @@ def go_back_to_list(page: Page):
         # Tab close is not critical, just log and continue
         pass
 
-    page.wait_for_timeout(1000)
+    page.wait_for_selector("div.card.cursor-pointer.rounded-0", timeout=SLOW_TIMEOUT)
     print("   ✓ Back to list")
 
 # ═══════════════════════════════════════════════════════════════════
@@ -387,7 +388,7 @@ def decide_price(page: Page) -> str:
 
     try:
         MODAL = ".modal-mask"
-        page.wait_for_selector(MODAL, state="visible", timeout=8000)
+        page.wait_for_selector(MODAL, state="visible", timeout=SLOW_TIMEOUT)
 
         # Values are inside readonly <input> elements — innerText misses them.
         # We must read .value via JavaScript directly from the DOM inputs.
@@ -405,7 +406,7 @@ def decide_price(page: Page) -> str:
                     }
                     return false;
                 }""",
-                timeout=8000
+                timeout=SLOW_TIMEOUT
             )
             print("   ↳ Modal field values confirmed loaded")
         except Exception:
@@ -475,21 +476,21 @@ def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErr
 
     # ── Open Image Manager ─────────────────────────────────────────
     print("   ↳ Clicking Image Manager button...")
-    page.locator("button", has_text="Image Manager").first.click(timeout=5_000)
-    page.locator(MODAL).wait_for(state="visible", timeout=15_000)
+    page.locator("button", has_text="Image Manager").first.click(timeout=SLOW_TIMEOUT)
+    page.locator(MODAL).wait_for(state="visible", timeout=SLOW_TIMEOUT)
     try:
-        page.wait_for_selector(f"{MODAL} button.btn-primary", timeout=20_000)
+        page.wait_for_selector(f"{MODAL} button.btn-primary", timeout=SLOW_TIMEOUT)
         print("   ✓ Image Manager loaded")
     except Exception:
-        page.wait_for_timeout(2000)
+        page.wait_for_selector(f"{MODAL} button.btn-primary", timeout=SLOW_TIMEOUT)
         print("   ✓ Image Manager opened (fallback wait)")
 
     # ── Open Upload sub-modal ──────────────────────────────────────
     page.locator(f"{MODAL} button.btn-primary", has_text="Upload").click()
-    page.locator(UPLOAD).wait_for(state="visible", timeout=10_000)
+    page.locator(UPLOAD).wait_for(state="visible", timeout=SLOW_TIMEOUT)
 
     # ── Set files ──────────────────────────────────────────────────
-    with page.expect_file_chooser(timeout=15_000) as fc_info:
+    with page.expect_file_chooser(timeout=SLOW_TIMEOUT) as fc_info:
         page.locator(f"{UPLOAD} .btn-file-upload").first.click()
     fc_info.value.set_files(paths)
     print(f"   ✓ {len(paths)} file(s) queued via file chooser")
@@ -519,12 +520,12 @@ def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErr
                 }
                 return true;
             }""",
-            timeout=60_000
-        )
+                timeout=SLOW_TIMEOUT
+            )
         print("   ✓ All uploads settled")
     except Exception as e:
         print(f"   ⚠ Timeout waiting for upload results ({e}) — continuing anyway")
-        page.wait_for_timeout(UPLOAD_WAIT_MS)
+        page.wait_for_selector('.file-preview-container .file-preview', timeout=SLOW_TIMEOUT)
 
     # ── Check for errors (ONLY on first upload for this type) ──────
     is_first = state.is_first_upload(unit_type)
@@ -545,9 +546,8 @@ def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErr
         }""")
 
         if failed_filenames:
-            n_failed  = len(failed_filenames)
+            n_failed = len(failed_filenames)
             n_success = len(paths) - n_failed
-            # Map filenames back to full local paths
             failed_paths = [p for p in paths if Path(p).name in failed_filenames]
 
             print(f"\n   ⚠ {n_failed} image(s) failed to upload:")
@@ -558,7 +558,6 @@ def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErr
                 ans = input(f"\n   ❓ Continue with {n_success} image(s) instead of {len(paths)}? (y/n): ").strip().lower()
 
                 if ans == "y":
-                    # User is OK — omit failed images, update pool, don't ask again
                     state.mark_acknowledged(unit_type)
                     successful_paths = [p for p in paths if p not in failed_paths]
                     mapping[unit_type] = successful_paths
@@ -568,28 +567,28 @@ def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErr
                     if page.locator(UPLOAD).is_visible():
                         try:
                             page.locator(f"{UPLOAD} .btn-modal-close").click()
-                            page.locator(UPLOAD).wait_for(state="hidden", timeout=5_000)
+                            page.locator(UPLOAD).wait_for(state="hidden", timeout=SLOW_TIMEOUT)
                             print("   ✓ Upload modal closed")
                         except Exception as e:
                             print(f"   ⚠ Modal close timeout: {e} — continuing")
-                            page.wait_for_timeout(500)
+                            page.wait_for_selector(UPLOAD, state="hidden", timeout=SLOW_TIMEOUT)
                     else:
                         print("   ℹ Upload modal already closed")
                 else:
                     # User is NOT OK — show faulty paths, wait, ask for new folder
                     try:
                         page.locator(f"{UPLOAD} .btn-modal-close").click()
-                        page.locator(UPLOAD).wait_for(state="hidden", timeout=5_000)
+                        page.locator(UPLOAD).wait_for(state="hidden", timeout=SLOW_TIMEOUT)
                     except Exception:
                         try:
                             page.press("Escape")
-                            page.wait_for_timeout(300)
+                            page.wait_for_selector(UPLOAD, state="hidden", timeout=SLOW_TIMEOUT)
                         except Exception:
                             pass
                     # Close Image Manager too so user can go back to list
                     try:
-                        page.locator(f"{MODAL} button", has_text="Cancel").first.click(timeout=3_000)
-                        page.locator(MODAL).wait_for(state="hidden", timeout=5_000)
+                        page.locator(f"{MODAL} button", has_text="Cancel").first.click(timeout=SLOW_TIMEOUT)
+                        page.locator(MODAL).wait_for(state="hidden", timeout=SLOW_TIMEOUT)
                     except Exception:
                         pass
 
@@ -619,11 +618,11 @@ def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErr
                 if page.locator(UPLOAD).is_visible():
                     try:
                         page.locator(f"{UPLOAD} .btn-modal-close").click()
-                        page.locator(UPLOAD).wait_for(state="hidden", timeout=5_000)
+                        page.locator(UPLOAD).wait_for(state="hidden", timeout=SLOW_TIMEOUT)
                         print("   ✓ Upload modal closed")
                     except Exception as e:
                         print(f"   ⚠ Modal close timeout: {e} — continuing")
-                        page.wait_for_timeout(500)
+                        page.wait_for_selector(UPLOAD, state="hidden", timeout=SLOW_TIMEOUT)
                 else:
                     print("   ℹ Upload modal already closed")
         else:
@@ -631,11 +630,11 @@ def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErr
             if page.locator(UPLOAD).is_visible():
                 try:
                     page.locator(f"{UPLOAD} .btn-modal-close").click()
-                    page.locator(UPLOAD).wait_for(state="hidden", timeout=5_000)
+                    page.locator(UPLOAD).wait_for(state="hidden", timeout=SLOW_TIMEOUT)
                     print("   ✓ Upload modal closed")
                 except Exception as e:
                     print(f"   ⚠ Modal close timeout: {e} — continuing")
-                    page.wait_for_timeout(500)
+                    page.wait_for_selector(UPLOAD, state="hidden", timeout=SLOW_TIMEOUT)
             else:
                 print("   ℹ Upload modal already closed")
 
@@ -648,11 +647,11 @@ def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErr
         if page.locator(UPLOAD).is_visible():
             try:
                 page.locator(f"{UPLOAD} .btn-modal-close").click()
-                page.locator(UPLOAD).wait_for(state="hidden", timeout=5_000)
+                page.locator(UPLOAD).wait_for(state="hidden", timeout=SLOW_TIMEOUT)
                 print("   ✓ Upload modal closed")
             except Exception as e:
                 print(f"   ⚠ Could not close modal: {e} — proceeding anyway")
-                page.wait_for_timeout(300)
+                page.wait_for_selector(UPLOAD, state="hidden", timeout=SLOW_TIMEOUT)
         else:
             print("   ℹ Upload modal already auto-closed, proceeding to tagging…")
 
@@ -675,7 +674,7 @@ def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErr
         if "btn-primary" in btn_class:
             continue
         tag_btn.click()
-        page.wait_for_timeout(200)
+        page.wait_for_selector(f"{MODAL} .image-wrapper.faded", timeout=SLOW_TIMEOUT)
         tagged += 1
 
     print(f"   ✓ Tagged {tagged} image(s)")
@@ -683,9 +682,9 @@ def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErr
 
     # ── Cancel instead of Save (images auto-save, Cancel bypasses permission error) ───
     cancel_btn = page.locator(f"{MODAL} button", has_text="Cancel")
-    cancel_btn.wait_for(state="visible", timeout=10_000)
+    cancel_btn.wait_for(state="visible", timeout=SLOW_TIMEOUT)
     cancel_btn.click()
-    page.locator(MODAL).wait_for(state="hidden", timeout=10_000)
+    page.locator(MODAL).wait_for(state="hidden", timeout=SLOW_TIMEOUT)
     print("   ✓ Cancelled (images saved normally)")
 
     return actual_count
@@ -703,9 +702,9 @@ def step_publish(page: Page, n_images: int):
 
     # ── Open modal ─────────────────────────────────────────────────
     print("   ↳ Opening Publish Unit (Clients) modal...")
-    page.locator("button", has_text="Publish Unit (Clients)").first.click(timeout=3_000)
-    page.locator(MODAL).wait_for(state="visible", timeout=12_000)
-    page.wait_for_selector("text=Price Display", timeout=10_000)
+    page.locator("button", has_text="Publish Unit (Clients)").first.click(timeout=SLOW_TIMEOUT)
+    page.locator(MODAL).wait_for(state="visible", timeout=SLOW_TIMEOUT)
+    page.wait_for_selector("text=Price Display", timeout=SLOW_TIMEOUT)
     print("   ✓ Modal open")
 
     # ── Price display (Fields tab is default) ──────────────────────
@@ -723,14 +722,26 @@ def step_publish(page: Page, n_images: int):
         print(f"   ↳ Setting to: Down Payment")
         if page.locator(UNIT_PRICE_CB).is_checked():
             page.locator(UNIT_PRICE_CB).click()
-            page.wait_for_timeout(200)
+            page.wait_for_function(
+                f"""() => {{
+                    const el = document.querySelector({UNIT_PRICE_CB!r});
+                    return el ? !el.checked : false;
+                }}""",
+                timeout=SLOW_TIMEOUT,
+            )
         if not page.locator(DOWN_PAYMENT_CB).is_checked():
             page.locator(DOWN_PAYMENT_CB).click()
     else:
         print(f"   ↳ Setting to: Unit Price")
         if page.locator(DOWN_PAYMENT_CB).is_checked():
             page.locator(DOWN_PAYMENT_CB).click()
-            page.wait_for_timeout(200)
+            page.wait_for_function(
+                f"""() => {{
+                    const el = document.querySelector({DOWN_PAYMENT_CB!r});
+                    return el ? !el.checked : false;
+                }}""",
+                timeout=SLOW_TIMEOUT,
+            )
         if not page.locator(UNIT_PRICE_CB).is_checked():
             page.locator(UNIT_PRICE_CB).click()
 
@@ -741,7 +752,7 @@ def step_publish(page: Page, n_images: int):
     # ── Switch to Images tab ───────────────────────────────────────
     print("   ── Switching to Images tab…")
     page.locator(f"{MODAL} button", has_text="Images").click()
-    page.wait_for_timeout(800)
+    page.wait_for_selector(f"{MODAL} .col-6.col-md-3.col-lg-3.py-2", timeout=SLOW_TIMEOUT)
 
     # ── Select the N newest images ─────────────────────────────────
     img_cols = page.locator(f"{MODAL} .col-6.col-md-3.col-lg-3.py-2")
@@ -755,7 +766,7 @@ def step_publish(page: Page, n_images: int):
         wrapper_class = wrapper.get_attribute("class") or ""
         if "faded" in wrapper_class:
             wrapper.click()
-            page.wait_for_timeout(150)
+            page.wait_for_selector(f"{MODAL} .col-6.col-md-3.col-lg-3.py-2", timeout=SLOW_TIMEOUT)
             selected += 1
         else:
             selected += 1
@@ -764,20 +775,20 @@ def step_publish(page: Page, n_images: int):
 
     # ── Check Published checkbox ───────────────────────────────────
     page.locator(f"{MODAL} button", has_text="Fields").click()
-    page.wait_for_timeout(500)
+    page.wait_for_selector("text=Price Display", timeout=SLOW_TIMEOUT)
 
     try:
         published_cb = page.locator(f"{MODAL}").get_by_text("Published", exact=False).last.locator("ancestor::label input[type='checkbox']")
         if not published_cb.is_checked():
             published_cb.check()
-            page.wait_for_timeout(200)
+            page.wait_for_selector(f"{MODAL} input[type='checkbox']", timeout=SLOW_TIMEOUT)
             print("   ✓ Published checkbox enabled")
     except Exception:
         try:
             published_cb = page.locator(f"{MODAL} input[type='checkbox']").last
             if not published_cb.is_checked():
                 published_cb.check()
-                page.wait_for_timeout(200)
+                page.wait_for_selector(f"{MODAL} input[type='checkbox']", timeout=SLOW_TIMEOUT)
                 print("   ✓ Published checkbox enabled")
         except Exception as e:
             print(f"   ⚠ Could not find Published checkbox: {e}")
@@ -789,17 +800,17 @@ def step_publish(page: Page, n_images: int):
     # Wait for modal to CLOSE — confirms save completed.
     # System is very slow, so wait up to 45s for modal to close.
     try:
-        page.locator(MODAL).wait_for(state="hidden", timeout=45_000)
+        page.locator(MODAL).wait_for(state="hidden", timeout=SLOW_TIMEOUT)
         print("   ✓ Modal closed — save confirmed")
     except Exception:
-        print("   ⚠ Modal did not close in 45s — continuing anyway")
-        page.wait_for_timeout(3000)
+        print("   ⚠ Modal did not close in expected time — continuing anyway")
+        page.wait_for_selector(MODAL, state="hidden", timeout=SLOW_TIMEOUT)
 
     # ── Wait for freeze overlay to disappear (system freeze message) ──
     # The CRM shows a freeze-message-container during processing that blocks clicks.
     # Wait for it to disappear before trying to navigate back.
     try:
-        page.wait_for_selector(".freeze-message-container", state="hidden", timeout=30_000)
+        page.wait_for_selector(".freeze-message-container", state="hidden", timeout=SLOW_TIMEOUT)
         print("   ✓ Freeze overlay cleared")
     except Exception:
         print("   ⚠ Freeze overlay still visible, proceeding anyway")
@@ -814,17 +825,16 @@ def process_unit(page: Page, url: str, name: str, mapping: dict, state: UploadEr
     utype = extract_type(name)
     if utype not in mapping:
         raise KeyError(
-            f"Type '{utype}' has no images assigned. "
-            f"Available: {list(mapping.keys())}"
+            f"Type '{utype}' has no images assigned. Available: {list(mapping.keys())}"
         )
     print(f"   Type: {utype}  |  {len(mapping[utype])} image(s)")
     if url:
         page.goto(url)
-        page.wait_for_load_state("networkidle")
-    
+        page.wait_for_load_state("networkidle", timeout=SLOW_TIMEOUT)
+
     # ── Check if unit is already published ──────────────────────────
     publish_status = check_publish_status(page)
-    
+
     if publish_status == "red":
         # Not published — proceed normally with upload and publish
         print("   ↳ Status: Not published (RED) — proceeding normally with upload & publish")
@@ -926,9 +936,9 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
 
             card_el.scroll_into_view_if_needed()
             print(f"   [DEBUG] Click executing...")
-            card_el.click(timeout=5_000)
+            card_el.click(timeout=SLOW_TIMEOUT)
             print(f"   [DEBUG] Click executed - waiting for navigation...")
-            page.wait_for_load_state("networkidle", timeout=15_000)
+            page.wait_for_load_state("networkidle", timeout=SLOW_TIMEOUT)
 
             # POST-CLICK DIAGNOSTICS
             print(f"   [DEBUG] After click - New URL: {page.url}")
@@ -944,7 +954,7 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
             # Check for overlay blocking
             try:
                 overlay = page.locator("[role='dialog'], .modal, .overlay, [class*='backdrop']").first
-                if overlay.is_visible(timeout=500):
+                if overlay.is_visible(timeout=SLOW_TIMEOUT):
                     print(f"   [DEBUG] ⚠ Overlay detected after click!")
             except Exception:
                 pass
@@ -952,7 +962,7 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
             # Wait for Image Manager to fully render.
             # networkidle fires too early — Vue still needs time to mount buttons.
             # wait_for_selector polls until visible instead of checking once.
-            page.wait_for_selector("button:has-text('Image Manager')", state="visible", timeout=15_000)
+            page.wait_for_selector("button:has-text('Image Manager')", state="visible", timeout=SLOW_TIMEOUT)
 
             print(f"   ✓ Opened detail page")
             process_unit(page, None, name, mapping, state)
