@@ -249,6 +249,55 @@ def confirm_mapping(mapping: dict) -> bool:
         if ans == "n": return False
         print("  Enter y or n.")
 
+def update_image_mapping(existing_mapping: dict, new_types: list) -> dict:
+    """
+    Check for NEW unit types on current page.
+    If found, ask user for paths only for new types.
+    Reuse existing paths for known types.
+    """
+    new_types_needed = [t for t in new_types if t not in existing_mapping]
+    
+    if not new_types_needed:
+        # All types already known, no new asking needed
+        print(f"\n  All {len(new_types)} type(s) already saved:  {',  '.join(new_types)}")
+        return existing_mapping
+    
+    # Found new types, ask user for paths
+    print(f"\n{'─'*50}")
+    print(f"  Found {len(new_types)} type(s):  {',  '.join(new_types)}")
+    print(f"  New type(s):  {',  '.join(new_types_needed)}")
+    print(f"  Saved type(s):  {',  '.join([t for t in new_types if t in existing_mapping])}")
+    print(f"{'─'*50}")
+    
+    for t in new_types_needed:
+        while True:
+            try:
+                files = validate_folder(clean_path(input(f"\n  Folder path for [{t}]: ")))
+                print(f"  ✓ {len(files)} image(s) found")
+                existing_mapping[t] = files
+                break
+            except FileNotFoundError as e:
+                print(f"  ✗ {e} — try again")
+    
+    # Show summary for new types
+    print(f"\n{'═'*50}")
+    print("  NEW MAPPINGS ADDED")
+    print(f"{'─'*50}")
+    for t in new_types_needed:
+        files = existing_mapping[t]
+        folder = str(Path(files[0]).parent) if files else "—"
+        print(f"  {t:<20} →  {len(files)} image(s)")
+        print(f"  {'':20}    {folder}")
+    print(f"{'═'*50}")
+    
+    while True:
+        ans = input("\n  All good? Continue? (y/n): ").strip().lower()
+        if ans == "y": return existing_mapping
+        if ans == "n":
+            print("\n  Cancelled.")
+            return None
+        print("  Enter y or n.")
+
 # ═══════════════════════════════════════════════════════════════════
 #  CHECK PUBLISH STATUS
 # ═══════════════════════════════════════════════════════════════════
@@ -959,6 +1008,23 @@ def main():
         page_num = 1
 
         while True:
+            # ═══════════════════════════════════════════════════════════════
+            #  PAGE SCANNING LOGIC (Different behavior based on mode)
+            # ═══════════════════════════════════════════════════════════════
+            if page_num > 1 and not same_images_mode:
+                # Scenario 1: Different images per type - rescan for new types
+                print(f"\n  Scanning page {page_num} for NEW unit types…")
+                current_page_types = scan_unit_types(page)
+                if current_page_types:
+                    updated_mapping = update_image_mapping(mapping, current_page_types)
+                    if updated_mapping is None:
+                        print("\n  Cancelled.")
+                        break
+                    mapping = updated_mapping
+            elif page_num > 1 and same_images_mode:
+                # Scenario 2: Same images for all - skip scanning, just use existing mapping
+                print(f"\n  Page {page_num} - using saved image set for all units (no rescan needed)")
+            
             process_current_page(page, mapping, page_num, results, state)
 
             pg_ok   = sum(1 for r in results if r["page"] == page_num and r["status"] == "OK")
