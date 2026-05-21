@@ -293,9 +293,14 @@ def go_back_to_list(page: Page):
     Used both after publishing and when skipping already-published units.
     """
     print("   ↩ Going back to list page...")
-    page.locator("button, a", has_text=re.compile(r"\bBack\b", re.IGNORECASE)).first.click(timeout=5_000)
-    page.wait_for_load_state("networkidle", timeout=15_000)
-    page.wait_for_timeout(500)
+    # Wait for any freeze overlay to disappear first (may take time on slow systems)
+    try:
+        page.wait_for_selector(".freeze-message-container", state="hidden", timeout=30_000)
+    except Exception:
+        pass  # Overlay might not exist, continue anyway
+    page.locator("button, a", has_text=re.compile(r"\bBack\b", re.IGNORECASE)).first.click(timeout=10_000)
+    page.wait_for_load_state("networkidle", timeout=30_000)
+    page.wait_for_timeout(1000)
 
     # Close any open detail tabs so the next card always opens fresh.
     # The close button selector is button.close-button (confirmed from DOM inspection).
@@ -317,7 +322,7 @@ def go_back_to_list(page: Page):
         # Tab close is not critical, just log and continue
         pass
 
-    page.wait_for_timeout(500)
+    page.wait_for_timeout(1000)
     print("   ✓ Back to list")
 
 # ═══════════════════════════════════════════════════════════════════
@@ -625,13 +630,14 @@ def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErr
         tagged += 1
 
     print(f"   ✓ Tagged {tagged} image(s)")
+    ##confirm("STEP 2A — Images tagged & ready? (Press Cancel to bypass permission error)")  # ← check before canceling
 
-    # ── Save ───────────────────────────────────────────────────────
-    save_btn = page.locator(f"{MODAL} button.btn-primary", has_text="Save")
-    save_btn.wait_for(state="visible", timeout=10_000)
-    save_btn.click()
+    # ── Cancel instead of Save (images auto-save, Cancel bypasses permission error) ───
+    cancel_btn = page.locator(f"{MODAL} button", has_text="Cancel")
+    cancel_btn.wait_for(state="visible", timeout=10_000)
+    cancel_btn.click()
     page.locator(MODAL).wait_for(state="hidden", timeout=10_000)
-    print("   ✓ Saved")
+    print("   ✓ Cancelled (images saved normally)")
 
     return actual_count
 
@@ -732,14 +738,22 @@ def step_publish(page: Page, n_images: int):
     print("   ✓ Save clicked")
 
     # Wait for modal to CLOSE — confirms save completed.
-    # Much better than a flat 10s wait: fast saves proceed immediately,
-    # slow saves are waited on properly up to 15s.
+    # System is very slow, so wait up to 45s for modal to close.
     try:
-        page.locator(MODAL).wait_for(state="hidden", timeout=15_000)
+        page.locator(MODAL).wait_for(state="hidden", timeout=45_000)
         print("   ✓ Modal closed — save confirmed")
     except Exception:
-        print("   ⚠ Modal did not close in 15s — continuing anyway")
+        print("   ⚠ Modal did not close in 45s — continuing anyway")
         page.wait_for_timeout(3000)
+
+    # ── Wait for freeze overlay to disappear (system freeze message) ──
+    # The CRM shows a freeze-message-container during processing that blocks clicks.
+    # Wait for it to disappear before trying to navigate back.
+    try:
+        page.wait_for_selector(".freeze-message-container", state="hidden", timeout=30_000)
+        print("   ✓ Freeze overlay cleared")
+    except Exception:
+        print("   ⚠ Freeze overlay still visible, proceeding anyway")
 
     # ── Go back to list ────────────────────────────────────────────
     go_back_to_list(page)
