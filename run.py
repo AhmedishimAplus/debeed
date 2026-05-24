@@ -87,6 +87,29 @@ def extract_type(unit_name: str) -> str:
     parts = unit_name.split("-")
     return parts[-1].strip() if parts else unit_name.strip()
 
+def resolve_unit_type(unit_text: str, mapping: dict) -> str:
+    extracted = extract_type(unit_text)
+    if extracted in mapping:
+        return extracted
+
+    def normalize(value: str) -> str:
+        return re.sub(r"[\s\-_]+", "", value).lower()
+
+    normalized_text = normalize(unit_text)
+    normalized_extracted = normalize(extracted)
+
+    for key in mapping:
+        if normalize(key) == normalized_extracted:
+            return key
+
+    matches = [key for key in mapping if normalize(key) in normalized_text]
+    if matches:
+        return max(matches, key=len)
+
+    raise KeyError(
+        f"Could not resolve unit type from '{unit_text}'. Available: {list(mapping.keys())}"
+    )
+
 def extract_unit_names_from_text(page: Page) -> list:
     """Extract visible unit names from the list page text.
     This is a fallback for pages where unit cards are not anchor tags.
@@ -822,11 +845,7 @@ def step_publish(page: Page, n_images: int):
 #  PROCESS ONE UNIT
 # ═══════════════════════════════════════════════════════════════════
 def process_unit(page: Page, url: str, name: str, mapping: dict, state: UploadErrorState):
-    utype = extract_type(name)
-    if utype not in mapping:
-        raise KeyError(
-            f"Type '{utype}' has no images assigned. Available: {list(mapping.keys())}"
-        )
+    utype = resolve_unit_type(name, mapping)
     print(f"   Type: {utype}  |  {len(mapping[utype])} image(s)")
     if url:
         page.goto(url)
@@ -914,8 +933,10 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
 
         # Read the name directly from the card element
         try:
-            name = card_el.inner_text().split("\n")[0].strip()
+            card_text = card_el.inner_text().strip()
+            name = card_text.split("\n")[0].strip()
         except Exception:
+            card_text = ""
             name = f"Unit {i + 1}"
 
         print(f"\n  [{i + 1}/{total_cards}]  {name}")
@@ -965,7 +986,7 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
             page.wait_for_selector("button:has-text('Image Manager')", state="visible", timeout=SLOW_TIMEOUT)
 
             print(f"   ✓ Opened detail page")
-            process_unit(page, None, name, mapping, state)
+            process_unit(page, None, card_text or name, mapping, state)
             results.append({"page": page_num, "unit": name, "url": page.url, "status": "OK"})
             print("  ✅ Done")
         except Exception as e:
