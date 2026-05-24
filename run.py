@@ -1302,14 +1302,77 @@ def main():
                 pass
 
             print(f"{'─'*50}")
-            print("  Enter  →  I moved to next page, continue")
-            print("  done   →  Finish and save results")
-            ans = input("\n  > ").strip().lower()
-            if ans == "done":
+            # Automatic pagination: read visible pagination controls
+            try:
+                cur_el = page.locator("input[type='number']").last
+                total_el = page.locator("span.text-nowrap").last
+                cur_str = cur_el.input_value().strip()
+                cur = int(cur_str) if cur_str else 1
+                total_text = total_el.inner_text() or ""
+                m = re.search(r"\d+", total_text)
+                total = int(m.group()) if m else cur
+                print(f"  Pagination: {cur}/{total}")
+            except Exception as e:
+                print(f"   ⚠ Could not read pagination: {e} — falling back to manual advance")
+                ans = input("\n  > ").strip().lower()
+                if ans == "done":
+                    break
+                page_num += 1
+                page.wait_for_load_state("networkidle")
+                continue
+
+            # If we're on the last page, finish and exit the loop
+            if cur >= total:
+                print("  ↳ Reached last page — finishing")
                 break
 
-            page_num += 1
-            page.wait_for_load_state("networkidle")
+            # Otherwise click Next and wait for the new page to render
+            next_btn = page.locator("button.btn-icon:has(i.fa-angle-right)").last
+            try:
+                if not next_btn.is_enabled() or next_btn.get_attribute("disabled"):
+                    print("   ↳ Next button disabled — treating as last page")
+                    break
+            except Exception:
+                # If attribute checks fail, attempt click anyway
+                pass
+
+            print("  ↳ Clicking Next page…")
+            try:
+                next_btn.click(timeout=SLOW_TIMEOUT)
+            except Exception as e:
+                print(f"   ⚠ Next click failed: {e} — stopping")
+                break
+
+            # Layered waits to ensure the new page has rendered
+            try:
+                page.wait_for_load_state("networkidle", timeout=SLOW_TIMEOUT)
+            except Exception:
+                pass
+            try:
+                page.wait_for_selector("div.card.cursor-pointer.rounded-0", state="visible", timeout=SLOW_TIMEOUT)
+            except Exception:
+                pass
+
+            # Wait until the visible page-number input has changed value
+            try:
+                prev = str(cur)
+                page.wait_for_function(
+                    f"""() => {{
+                        const els = document.querySelectorAll('input[type=\'number\']');
+                        if (!els || els.length === 0) return false;
+                        const v = els[els.length - 1].value;
+                        return v !== '{prev}' && v !== '';
+                    }}""",
+                    timeout=SLOW_TIMEOUT,
+                )
+            except Exception:
+                print("   ⚠ Timed out waiting for page number to change — proceeding anyway")
+
+            # Update page_num to the new current value if possible
+            try:
+                page_num = int(page.locator("input[type='number']").last.input_value().strip())
+            except Exception:
+                page_num = cur + 1
 
         with open("results.csv", "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=["page", "unit", "url", "status"])
