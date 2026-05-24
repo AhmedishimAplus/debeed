@@ -36,7 +36,8 @@ SLOW_TIMEOUT   = 300_000    # 5 minutes - used for unpredictable slow CRM respon
 #  CONFIRMATION  ← delete all confirm() calls to go auto
 # ═══════════════════════════════════════════════════════════════════
 def confirm(step: str):
-    input(f"\n✋  {step}\n   Press Enter to continue... ")
+    # Auto mode: skip manual confirmations for full automation
+    return
 
 # ═══════════════════════════════════════════════════════════════════
 #  ERROR HANDLING STATE (tracks upload errors per type/globally)
