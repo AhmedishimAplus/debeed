@@ -87,6 +87,22 @@ def extract_type(unit_name: str) -> str:
     parts = unit_name.split("-")
     return parts[-1].strip() if parts else unit_name.strip()
 
+def extract_project_and_type(unit_name: str) -> tuple:
+    """Extract project and type from a dash-delimited unit name.
+    Preferred parsing: project = parts[-3], type = parts[-1].
+    Falls back to best-effort when parts are short.
+    """
+    parts = [p.strip() for p in unit_name.split("-") if p.strip()]
+    if len(parts) >= 3:
+        project = parts[-3].strip()
+        utype = parts[-1].strip()
+        return project, utype
+    # Fallback: try to infer project from middle part if available
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    # Single token fallback
+    return (parts[0].strip() if parts else "Unknown Project"), (parts[-1].strip() if parts else "Unknown Type")
+
 def resolve_unit_type(unit_text: str, mapping: dict) -> str:
     extracted = extract_type(unit_text)
     if extracted in mapping:
@@ -206,6 +222,81 @@ def scan_unit_types(page: Page) -> list:
     print(f"   DEBUG: Extracted types: {types}")
     return types
 
+
+def scan_projects_types(page: Page) -> dict:
+    """Scan the page and return a mapping of project -> list of unit types."""
+    page.wait_for_load_state("networkidle", timeout=SLOW_TIMEOUT)
+    page.wait_for_selector("div.card.cursor-pointer.rounded-0", timeout=SLOW_TIMEOUT)
+    # Read directly from the card grid to avoid multiline noise (dates, BUA, etc.)
+    cards = page.locator("div.card.cursor-pointer.rounded-0")
+    total = cards.count()
+    projects = {}
+
+    def looks_valid_type(t: str) -> bool:
+        return t and len(t) > 2 and not any(c.isdigit() for c in t[:3])
+
+    for i in range(total):
+        try:
+            card_text = cards.nth(i).inner_text().strip()
+            title = card_text.split("\n")[0].strip()
+            if not title:
+                continue
+            proj, utype = extract_project_and_type(title)
+        except Exception:
+            continue
+        if not looks_valid_type(utype):
+            continue
+        pdata = projects.setdefault(proj, [])
+        if utype not in pdata:
+            pdata.append(utype)
+
+    print(f"   DEBUG: Projects found: {list(projects.keys())}")
+    return projects
+
+
+def collect_image_mapping_per_project(project_types: dict) -> dict:
+    """Interactively collect image folders per project. Returns nested mapping.
+    Structure:
+      { 'Project Name': { '_same_for_all': True/False, '_images': [...], 'Type': [...] } }
+    """
+    mapping = {}
+    print(f"\n{'─'*50}")
+    print(f"  Found {len(project_types)} project(s):  {',  '.join(project_types.keys())}")
+    print(f"{'─'*50}")
+
+    for proj, types in project_types.items():
+        print(f"\nProject: {proj}  —  {len(types)} type(s): {', '.join(types)}")
+        while True:
+            choice = input(f"\n  For project '{proj}': Same images for ALL types? (y/n): ").strip().lower()
+            if choice in ('y', 'n'): break
+            print(' Enter y or n.')
+
+        pdata = {'_same_for_all': False}
+        if choice == 'y':
+            while True:
+                try:
+                    files = validate_folder(clean_path(input(f"\n  Folder path for project '{proj}' (all types): ")))
+                    print(f"  ✓ {len(files)} image(s) found")
+                    pdata['_same_for_all'] = True
+                    pdata['_images'] = files
+                    break
+                except FileNotFoundError as e:
+                    print(f"  ✗ {e} — try again")
+        else:
+            for t in types:
+                while True:
+                    try:
+                        files = validate_folder(clean_path(input(f"\n  Folder path for [{proj} -> {t}]: ")))
+                        print(f"  ✓ {len(files)} image(s) found")
+                        pdata[t] = files
+                        break
+                    except FileNotFoundError as e:
+                        print(f"  ✗ {e} — try again")
+
+        mapping[proj] = pdata
+
+    return mapping
+
 # ═══════════════════════════════════════════════════════════════════
 #  COLLECT IMAGE PATHS FROM USER
 # ═══════════════════════════════════════════════════════════════════
@@ -233,6 +324,9 @@ def collect_image_mapping(types: list) -> dict:
             break
         print("  Enter y or n.")
 
+    # For backward compatibility, this function will collect a flat mapping
+    # of types → files. Higher-level per-project grouping is handled in
+    # `collect_image_mapping_per_project` which calls this helper per project.
     mapping = {}
 
     if choice == "y":
@@ -259,13 +353,32 @@ def collect_image_mapping(types: list) -> dict:
     return mapping
 
 def confirm_mapping(mapping: dict) -> bool:
+    # Mapping may be per-project (nested) or flat (type->files). Detect shape.
     print(f"\n{'═'*50}")
     print("  IMAGE MAPPING SUMMARY")
     print(f"{'─'*50}")
-    for t, files in mapping.items():
-        folder = str(Path(files[0]).parent) if files else "—"
-        print(f"  {t:<20} →  {len(files)} image(s)")
-        print(f"  {'':20}    {folder}")
+    first_val = next(iter(mapping.values())) if mapping else None
+    # Nested per-project mapping
+    if isinstance(first_val, dict):
+        for proj, pdata in mapping.items():
+            same = pdata.get("_same_for_all", False)
+            if same:
+                files = pdata.get("_images", [])
+                folder = str(Path(files[0]).parent) if files else "—"
+                print(f"  {proj}  (same for all types)")
+                print(f"    ALL TYPES  →  {len(files)} image(s)")
+                print(f"    {folder}")
+            else:
+                print(f"  {proj}  (per type)")
+                for t, files in pdata.items():
+                    if t.startswith("_"): continue
+                    folder = str(Path(files[0]).parent) if files else "—"
+                    print(f"    {t:<15} →  {len(files)} image(s)  from  {folder}")
+    else:
+        for t, files in mapping.items():
+            folder = str(Path(files[0]).parent) if files else "—"
+            print(f"  {t:<20} →  {len(files)} image(s)")
+            print(f"  {'':20}    {folder}")
     print(f"{'═'*50}")
     while True:
         ans = input("\n  Look good? Start? (y/n): ").strip().lower()
@@ -279,7 +392,20 @@ def update_image_mapping(existing_mapping: dict, new_types: list) -> dict:
     If found, ask user for paths only for new types.
     Reuse existing paths for known types.
     """
-    new_types_needed = [t for t in new_types if t not in existing_mapping]
+    # Support both flat mapping and per-project nested mapping
+    first_val = next(iter(existing_mapping.values())) if existing_mapping else None
+    if isinstance(first_val, dict):
+        # existing_mapping is per-project
+        # Expect new_types to be list of (project, type) tuples in this mode
+        new_types_needed = []
+        for proj, t in new_types:
+            pdata = existing_mapping.get(proj, {})
+            if pdata.get("_same_for_all"):
+                continue
+            if t not in pdata:
+                new_types_needed.append((proj, t))
+    else:
+        new_types_needed = [t for t in new_types if t not in existing_mapping]
     
     if not new_types_needed:
         # All types already known, no new asking needed
@@ -288,30 +414,58 @@ def update_image_mapping(existing_mapping: dict, new_types: list) -> dict:
     
     # Found new types, ask user for paths
     print(f"\n{'─'*50}")
-    print(f"  Found {len(new_types)} type(s):  {',  '.join(new_types)}")
-    print(f"  New type(s):  {',  '.join(new_types_needed)}")
-    print(f"  Saved type(s):  {',  '.join([t for t in new_types if t in existing_mapping])}")
+    if isinstance(first_val, dict):
+        # new_types is list of (proj, type) tuples
+        found_list = ', '.join(f"{p}->{t}" for p, t in new_types)
+        needed_list = ', '.join(f"{p}->{t}" for p, t in new_types_needed)
+        print(f"  Found entries: {found_list}")
+        print(f"  New entry(s) needed: {needed_list}")
+    else:
+        print(f"  Found {len(new_types)} type(s):  {',  '.join(new_types)}")
+        print(f"  New type(s):  {',  '.join(new_types_needed)}")
+        print(f"  Saved type(s):  {',  '.join([t for t in new_types if t in existing_mapping])}")
     print(f"{'─'*50}")
     
-    for t in new_types_needed:
-        while True:
-            try:
-                files = validate_folder(clean_path(input(f"\n  Folder path for [{t}]: ")))
-                print(f"  ✓ {len(files)} image(s) found")
-                existing_mapping[t] = files
-                break
-            except FileNotFoundError as e:
-                print(f"  ✗ {e} — try again")
+    if isinstance(first_val, dict):
+        for proj, t in new_types_needed:
+            pdata = existing_mapping.setdefault(proj, {"_same_for_all": False})
+            while True:
+                try:
+                    files = validate_folder(clean_path(input(f"\n  Folder path for [{proj} -> {t}]: ")))
+                    print(f"  ✓ {len(files)} image(s) found")
+                    pdata[t] = files
+                    break
+                except FileNotFoundError as e:
+                    print(f"  ✗ {e} — try again")
+    else:
+        for t in new_types_needed:
+            while True:
+                try:
+                    files = validate_folder(clean_path(input(f"\n  Folder path for [{t}]: ")))
+                    print(f"  ✓ {len(files)} image(s) found")
+                    existing_mapping[t] = files
+                    break
+                except FileNotFoundError as e:
+                    print(f"  ✗ {e} — try again")
     
     # Show summary for new types
     print(f"\n{'═'*50}")
     print("  NEW MAPPINGS ADDED")
     print(f"{'─'*50}")
-    for t in new_types_needed:
-        files = existing_mapping[t]
-        folder = str(Path(files[0]).parent) if files else "—"
-        print(f"  {t:<20} →  {len(files)} image(s)")
-        print(f"  {'':20}    {folder}")
+    first_val = next(iter(existing_mapping.values())) if existing_mapping else None
+    if isinstance(first_val, dict):
+        for proj, t in new_types_needed:
+            pdata = existing_mapping.get(proj, {})
+            files = pdata.get(t) if pdata.get('_same_for_all') is not True else pdata.get('_images', [])
+            folder = str(Path(files[0]).parent) if files else "—"
+            print(f"  {proj} -> {t:<20} →  {len(files)} image(s)")
+            print(f"  {'':20}    {folder}")
+    else:
+        for t in new_types_needed:
+            files = existing_mapping[t]
+            folder = str(Path(files[0]).parent) if files else "—"
+            print(f"  {t:<20} →  {len(files)} image(s)")
+            print(f"  {'':20}    {folder}")
     print(f"{'═'*50}")
     
     while True:
@@ -488,7 +642,9 @@ def decide_price(page: Page) -> str:
 # ═══════════════════════════════════════════════════════════════════
 #  STEP 1 — UPLOAD + TAG IMAGES
 # ═══════════════════════════════════════════════════════════════════
-def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErrorState, mapping: dict) -> int:
+def step_upload_images(page: Page, paths: list, project: str, unit_type: str, state: UploadErrorState, mapping: dict) -> int:
+    # Multi-project signature: include `project` so mapping updates write into
+    # mapping[project][unit_type] (or mapping[project]['_images'] for same_for_all).
     print("\n   ── STEP 1: Image Manager ──")
 
     random.shuffle(paths)
@@ -546,6 +702,7 @@ def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErr
                 timeout=SLOW_TIMEOUT
             )
         print("   ✓ All uploads settled")
+        confirm("STEP 1 — Images uploaded. Verify they appeared.")
     except Exception as e:
         print(f"   ⚠ Timeout waiting for upload results ({e}) — continuing anyway")
         page.wait_for_selector('.file-preview-container .file-preview', timeout=SLOW_TIMEOUT)
@@ -583,7 +740,12 @@ def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErr
                 if ans == "y":
                     state.mark_acknowledged(unit_type)
                     successful_paths = [p for p in paths if p not in failed_paths]
-                    mapping[unit_type] = successful_paths
+                    pdata = mapping.get(project, {})
+                    if pdata.get('_same_for_all'):
+                        pdata['_images'] = successful_paths
+                    else:
+                        pdata[unit_type] = successful_paths
+                    mapping[project] = pdata
                     actual_count = len(successful_paths)
                     print(f"   ✓ Pool updated to {actual_count} image(s), won't ask again for '{unit_type}'")
                     # Close upload modal and continue normally
@@ -626,16 +788,26 @@ def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErr
                         try:
                             new_files = validate_folder(new_raw)
                             print(f"   ✓ {len(new_files)} image(s) found in new folder")
-                            mapping[unit_type] = new_files
+                            pdata = mapping.get(project, {})
+                            if pdata.get('_same_for_all'):
+                                pdata['_images'] = new_files
+                            else:
+                                pdata[unit_type] = new_files
+                            mapping[project] = pdata
                             # Retry upload from scratch with new images
                             print(f"   ↳ Retrying upload with new images…")
-                            return step_upload_images(page, new_files, unit_type, state, mapping)
+                            return step_upload_images(page, new_files, project, unit_type, state, mapping)
                         except FileNotFoundError as e:
                             print(f"   ✗ {e} — try again")
             else:
                 # Already acknowledged for this type — silently omit, update pool
                 successful_paths = [p for p in paths if p not in failed_paths]
-                mapping[unit_type] = successful_paths
+                pdata = mapping.get(project, {})
+                if pdata.get('_same_for_all'):
+                    pdata['_images'] = successful_paths
+                else:
+                    pdata[unit_type] = successful_paths
+                mapping[project] = pdata
                 actual_count = len(successful_paths)
                 print(f"   ℹ Already acknowledged for '{unit_type}' — omitting {n_failed} failed image(s), using {actual_count}")
                 if page.locator(UPLOAD).is_visible():
@@ -701,7 +873,7 @@ def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErr
         tagged += 1
 
     print(f"   ✓ Tagged {tagged} image(s)")
-    ##confirm("STEP 2A — Images tagged & ready? (Press Cancel to bypass permission error)")  # ← check before canceling
+    confirm("STEP 2 — Tags applied. Verify correct images tagged.")
 
     # ── Cancel instead of Save (images auto-save, Cancel bypasses permission error) ───
     cancel_btn = page.locator(f"{MODAL} button", has_text="Cancel")
@@ -709,6 +881,7 @@ def step_upload_images(page: Page, paths: list, unit_type: str, state: UploadErr
     cancel_btn.click()
     page.locator(MODAL).wait_for(state="hidden", timeout=SLOW_TIMEOUT)
     print("   ✓ Cancelled (images saved normally)")
+    confirm("STEP 3 — Image Manager saved. Closed cleanly?")
 
     return actual_count
 
@@ -771,11 +944,13 @@ def step_publish(page: Page, n_images: int):
     up_final = page.locator(UNIT_PRICE_CB).is_checked()
     dp_final = page.locator(DOWN_PAYMENT_CB).is_checked()
     print(f"   ↳ Final state: Unit Price={up_final}  |  Down Payment={dp_final}")
+    confirm("STEP 4 — Price display correct?")
 
     # ── Switch to Images tab ───────────────────────────────────────
     print("   ── Switching to Images tab…")
     page.locator(f"{MODAL} button", has_text="Images").click()
     page.wait_for_selector(f"{MODAL} .col-6.col-md-3.col-lg-3.py-2", timeout=SLOW_TIMEOUT)
+    confirm("STEP 5 — Images tab open. Select your images.")
 
     # ── Select the N newest images ─────────────────────────────────
     img_cols = page.locator(f"{MODAL} .col-6.col-md-3.col-lg-3.py-2")
@@ -838,15 +1013,59 @@ def step_publish(page: Page, n_images: int):
     except Exception:
         print("   ⚠ Freeze overlay still visible, proceeding anyway")
 
+    confirm("STEP 6 — Publish saved. Listing looks correct?")
+
     # ── Go back to list ────────────────────────────────────────────
     go_back_to_list(page)
 
 # ═══════════════════════════════════════════════════════════════════
 #  PROCESS ONE UNIT
 # ═══════════════════════════════════════════════════════════════════
-def process_unit(page: Page, url: str, name: str, mapping: dict, state: UploadErrorState):
-    utype = resolve_unit_type(name, mapping)
-    print(f"   Type: {utype}  |  {len(mapping[utype])} image(s)")
+def process_unit(page: Page, url: str, name: str, mapping: dict, states: dict):
+    # Resolve project and type from name
+    parsed_project, parsed_type = extract_project_and_type(name)
+
+    def normalize(value: str) -> str:
+        return re.sub(r"[\s\-_]+", "", value).lower()
+
+    # Resolve project key in mapping
+    project = None
+    if parsed_project in mapping:
+        project = parsed_project
+    else:
+        nproj = normalize(parsed_project)
+        for key in mapping:
+            if normalize(key) == nproj or nproj in normalize(key) or normalize(key) in nproj:
+                project = key
+                break
+    if not project:
+        raise KeyError(f"Could not resolve project for '{name}'. Known projects: {list(mapping.keys())}")
+
+    # Resolve unit type within project mapping
+    pdata = mapping.get(project, {})
+    if pdata.get("_same_for_all"):
+        utype = parsed_type
+        images = pdata.get("_images", [])
+    else:
+        # Try direct match, then normalized matches
+        if parsed_type in pdata:
+            utype = parsed_type
+            images = pdata[utype]
+        else:
+            ntype = normalize(parsed_type)
+            match = None
+            for key in pdata:
+                if key.startswith("_"): continue
+                if normalize(key) == ntype or ntype in normalize(key) or normalize(key) in ntype:
+                    match = key
+                    break
+            if match:
+                utype = match
+                images = pdata[utype]
+            else:
+                raise KeyError(f"Could not resolve unit type '{parsed_type}' for project '{project}'. Available: { [k for k in pdata.keys() if not k.startswith('_')] }")
+
+    print(f"   Project: {project}  |  Type: {utype}  |  {len(images)} image(s)")
     if url:
         page.goto(url)
         page.wait_for_load_state("networkidle", timeout=SLOW_TIMEOUT)
@@ -857,7 +1076,8 @@ def process_unit(page: Page, url: str, name: str, mapping: dict, state: UploadEr
     if publish_status == "red":
         # Not published — proceed normally with upload and publish
         print("   ↳ Status: Not published (RED) — proceeding normally with upload & publish")
-        actual_count = step_upload_images(page, mapping[utype], utype, state, mapping)
+        state = states.get(project) if isinstance(states, dict) else states
+        actual_count = step_upload_images(page, images, project, utype, state, mapping)
         step_publish(page, n_images=actual_count)
     elif publish_status == "disabled":
         # Button is disabled (e.g., duplicate unit) — skip to next unit
@@ -871,7 +1091,7 @@ def process_unit(page: Page, url: str, name: str, mapping: dict, state: UploadEr
 # ═══════════════════════════════════════════════════════════════════
 #  PROCESS CURRENT PAGE  (only what's loaded right now)
 # ═══════════════════════════════════════════════════════════════════
-def process_current_page(page: Page, mapping: dict, page_num: int, results: list, state: UploadErrorState):
+def process_current_page(page: Page, mapping: dict, page_num: int, results: list, states: dict):
     list_url = page.url
 
     links = page.locator("a[href*='/resale-unit/'], a[href*='realestate-workspace/resale-unit/']").all()
@@ -900,7 +1120,7 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
         for i, (name, url) in enumerate(unit_data, 1):
             print(f"\n  [{i}/{len(unit_data)}]  {name}")
             try:
-                process_unit(page, url, name, mapping, state)
+                process_unit(page, url, name, mapping, states)
                 results.append({"page": page_num, "unit": name, "url": url, "status": "OK"})
                 print("  ✅ Done")
             except Exception as e:
@@ -986,7 +1206,7 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
             page.wait_for_selector("button:has-text('Image Manager')", state="visible", timeout=SLOW_TIMEOUT)
 
             print(f"   ✓ Opened detail page")
-            process_unit(page, None, card_text or name, mapping, state)
+            process_unit(page, None, name, mapping, states)
             results.append({"page": page_num, "unit": name, "url": page.url, "status": "OK"})
             print("  ✅ Done")
         except Exception as e:
@@ -1017,23 +1237,20 @@ def main():
         print("  → Set your filters and Available checkbox")
         input("  → Press Enter when ready… \n")
 
-        print("  Scanning page for unit types…")
-        types = scan_unit_types(page)
-        if not types:
-            print("  ✗ No unit types found. Are you on the list page?")
+        print("  Scanning page for projects and unit types…")
+        project_types = scan_projects_types(page)
+        if not project_types:
+            print("  ✗ No unit projects/types found. Are you on the list page?")
             return
 
-        mapping = collect_image_mapping(types)
+        mapping = collect_image_mapping_per_project(project_types)
         if not confirm_mapping(mapping):
             print("\n  Cancelled.")
             return
 
-        # Determine if using same images for all types or different per type
-        same_images_mode = all(
-            mapping[types[0]] == mapping[t] for t in types
-        ) if len(types) > 0 else False
-        state = UploadErrorState(same_images_mode=same_images_mode)
-        print(f"   Image mode: {'Same for all types' if same_images_mode else 'Different per type'}")
+        # Per-project upload error state tracker
+        states = { proj: UploadErrorState(same_images_mode=mapping[proj].get('_same_for_all', False)) for proj in mapping }
+        print(f"   Projects configured: {', '.join(mapping.keys())}")
 
         results  = []
         page_num = 1
@@ -1042,21 +1259,33 @@ def main():
             # ═══════════════════════════════════════════════════════════════
             #  PAGE SCANNING LOGIC (Different behavior based on mode)
             # ═══════════════════════════════════════════════════════════════
-            if page_num > 1 and not same_images_mode:
-                # Scenario 1: Different images per type - rescan for new types
-                print(f"\n  Scanning page {page_num} for NEW unit types…")
-                current_page_types = scan_unit_types(page)
-                if current_page_types:
-                    updated_mapping = update_image_mapping(mapping, current_page_types)
-                    if updated_mapping is None:
-                        print("\n  Cancelled.")
-                        break
-                    mapping = updated_mapping
-            elif page_num > 1 and same_images_mode:
-                # Scenario 2: Same images for all - skip scanning, just use existing mapping
-                print(f"\n  Page {page_num} - using saved image set for all units (no rescan needed)")
-            
-            process_current_page(page, mapping, page_num, results, state)
+            if page_num > 1:
+                print(f"\n  Scanning page {page_num} for projects/types…")
+                current_projects = scan_projects_types(page)
+                if current_projects:
+                    # For each project on the page, adapt mapping as needed
+                    for proj, types in current_projects.items():
+                        if proj not in mapping:
+                            print(f"\n  New project found: {proj} — requesting image folders")
+                            new_map = collect_image_mapping_per_project({proj: types})
+                            mapping.update(new_map)
+                            states[proj] = UploadErrorState(same_images_mode=mapping[proj].get('_same_for_all', False))
+                        else:
+                            if mapping[proj].get('_same_for_all'):
+                                print(f"\n  Skipping per-type checks for project '{proj}' — _same_for_all=True")
+                                # nothing to do for this project
+                                continue
+                            new_types = [t for t in types if t not in mapping[proj]]
+                            if not new_types:
+                                print(f"\n  No new types for project '{proj}' — nothing to prompt")
+                            if new_types:
+                                updated = update_image_mapping(mapping, [(proj, t) for t in new_types])
+                                if updated is None:
+                                    print("\n  Cancelled.")
+                                    break
+                                mapping = updated
+
+            process_current_page(page, mapping, page_num, results, states)
 
             pg_ok   = sum(1 for r in results if r["page"] == page_num and r["status"] == "OK")
             pg_fail = sum(1 for r in results if r["page"] == page_num and r["status"] != "OK")
