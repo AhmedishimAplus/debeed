@@ -282,8 +282,8 @@ def scan_projects_types(page: Page) -> dict:
 
     for i in range(total):
         try:
-            card_text = cards.nth(i).inner_text().strip()
-            title = card_text.split("\n")[0].strip()
+            title = cards.nth(i).locator("h5.card-title").inner_text().strip()
+            
             if not title:
                 continue
             proj, utype = extract_project_and_type(title)
@@ -1198,10 +1198,8 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
 
         # Read the name directly from the card element
         try:
-            card_text = card_el.inner_text().strip()
-            name = card_text.split("\n")[0].strip()
+            name = card_el.locator("h5.card-title").inner_text().strip()
         except Exception:
-            card_text = ""
             name = f"Unit {i + 1}"
 
         print(f"\n  [{i + 1}/{total_cards}]  {name}")
