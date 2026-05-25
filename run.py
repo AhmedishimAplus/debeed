@@ -18,7 +18,8 @@ SETUP (one-time):
   Launch Chrome via launch_chrome.bat, log in, navigate to filtered list.
 """
 
-import re, csv, random
+import re, csv, random, sys, builtins
+from datetime import datetime
 from pathlib import Path
 from playwright.sync_api import sync_playwright, Page
 
@@ -31,6 +32,49 @@ DP_THRESHOLD   = 80.0       # auto: if DP > this % of price → use Unit Price (
 IMAGE_TAG      = "Live Photo"
 UPLOAD_WAIT_MS = 3500
 SLOW_TIMEOUT   = 300_000    # 5 minutes - used for unpredictable slow CRM responses
+
+
+class Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
+def setup_run_logging():
+    logs_dir = Path("logs")
+    logs_dir.mkdir(exist_ok=True)
+
+    log_path = logs_dir / f"run_{datetime.now():%Y%m%d_%H%M%S}.txt"
+    log_file = open(log_path, "a", encoding="utf-8", buffering=1)
+
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    original_input = builtins.input
+
+    sys.stdout = Tee(original_stdout, log_file)
+    sys.stderr = Tee(original_stderr, log_file)
+
+    def logged_input(prompt: str = ""):
+        if prompt:
+            original_stdout.write(prompt)
+            original_stdout.flush()
+            log_file.write(f"PROMPT: {prompt.rstrip()}\n")
+        response = original_input("")
+        log_file.write(f"RESPONSE: {response}\n")
+        return response
+
+    builtins.input = logged_input
+
+    print(f"  Logging to: {log_path}")
+    return log_file, original_stdout, original_stderr, original_input, log_path
 
 # ═══════════════════════════════════════════════════════════════════
 #  CONFIRMATION  ← delete all confirm() calls to go auto
@@ -1219,6 +1263,7 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════
 def main():
+    setup_run_logging()
     print("\n" + "═"*50)
     print("  EGY Property Automation")
     print("═"*50)
