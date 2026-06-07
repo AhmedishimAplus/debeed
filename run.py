@@ -282,8 +282,10 @@ def scan_projects_types(page: Page) -> dict:
 
     for i in range(total):
         try:
-            title = cards.nth(i).locator("h5.card-title").inner_text().strip()
-            
+            card_text = cards.nth(i).inner_text().strip()
+            title = card_text.split("\n")[0].strip()
+            if not title:
+                title = cards.nth(i).locator("h5.card-title").inner_text().strip()
             if not title:
                 continue
             proj, utype = extract_project_and_type(title)
@@ -1298,37 +1300,9 @@ def main():
 
         results  = []
         page_num = 1
+        abort = False
 
         while True:
-            # ═══════════════════════════════════════════════════════════════
-            #  PAGE SCANNING LOGIC (Different behavior based on mode)
-            # ═══════════════════════════════════════════════════════════════
-            if page_num > 1:
-                print(f"\n  Scanning page {page_num} for projects/types…")
-                current_projects = scan_projects_types(page)
-                if current_projects:
-                    # For each project on the page, adapt mapping as needed
-                    for proj, types in current_projects.items():
-                        if proj not in mapping:
-                            print(f"\n  New project found: {proj} — requesting image folders")
-                            new_map = collect_image_mapping_per_project({proj: types})
-                            mapping.update(new_map)
-                            states[proj] = UploadErrorState(same_images_mode=mapping[proj].get('_same_for_all', False))
-                        else:
-                            if mapping[proj].get('_same_for_all'):
-                                print(f"\n  Skipping per-type checks for project '{proj}' — _same_for_all=True")
-                                # nothing to do for this project
-                                continue
-                            new_types = [t for t in types if t not in mapping[proj]]
-                            if not new_types:
-                                print(f"\n  No new types for project '{proj}' — nothing to prompt")
-                            if new_types:
-                                updated = update_image_mapping(mapping, [(proj, t) for t in new_types])
-                                if updated is None:
-                                    print("\n  Cancelled.")
-                                    break
-                                mapping = updated
-
             process_current_page(page, mapping, page_num, results, states)
 
             pg_ok   = sum(1 for r in results if r["page"] == page_num and r["status"] == "OK")
@@ -1386,6 +1360,14 @@ def main():
                 print(f"   ⚠ Next click failed: {e} — stopping")
                 break
 
+            # Wait for the URL to reflect the next page before scanning.
+            # This is more reliable than waiting for the page-number input alone.
+            try:
+                next_page = cur + 1
+                page.wait_for_url(lambda url: f"page={next_page}" in url, timeout=SLOW_TIMEOUT)
+            except Exception:
+                pass
+
             # Layered waits to ensure the new page has rendered
             try:
                 page.wait_for_load_state("networkidle", timeout=SLOW_TIMEOUT)
@@ -1396,7 +1378,9 @@ def main():
             except Exception:
                 pass
 
-            # Wait until the visible page-number input has changed value
+            # Wait until the visible page-number input has changed value.
+            # If this times out, the URL check above already told us the page changed,
+            # so we can still proceed safely.
             try:
                 prev = str(cur)
                 page.wait_for_function(
@@ -1416,6 +1400,51 @@ def main():
                 page_num = int(page.locator("input[type='number']").last.input_value().strip())
             except Exception:
                 page_num = cur + 1
+
+            # Wait for the freeze overlay to disappear (loading screen overlay).
+            # This ensures the cards are truly interactive and not obscured by loading state.
+            try:
+                page.wait_for_selector(".freeze-message-container", state="hidden", timeout=SLOW_TIMEOUT)
+            except Exception:
+                pass
+
+            # ═══════════════════════════════════════════════════════════════
+            #  PAGE FULLY LOADED — NOW SCAN FOR PROJECTS/TYPES
+            # ═══════════════════════════════════════════════════════════════
+            print(f"\n  ↳ Page {page_num} fully loaded. Scanning for projects/types…")
+            current_projects = scan_projects_types(page)
+            if current_projects:
+                # For each project on the page, adapt mapping as needed
+                for proj, types in current_projects.items():
+                    if proj not in mapping:
+                        print(f"\n  New project found: {proj} — requesting image folders")
+                        new_map = collect_image_mapping_per_project({proj: types})
+                        mapping.update(new_map)
+                        states[proj] = UploadErrorState(same_images_mode=mapping[proj].get('_same_for_all', False))
+                    else:
+                        if mapping[proj].get('_same_for_all'):
+                            print(f"\n  Skipping per-type checks for project '{proj}' — _same_for_all=True")
+                            # nothing to do for this project
+                            continue
+                        new_types = [t for t in types if t not in mapping[proj]]
+                        if not new_types:
+                            print(f"\n  No new types for project '{proj}' — nothing to prompt")
+                        if new_types:
+                            updated = update_image_mapping(mapping, [(proj, t) for t in new_types])
+                            if updated is None:
+                                print("\n  Cancelled.")
+                                abort = True
+                                break
+                            mapping = updated
+                
+                # After scanning and potential mapping updates, proceed automatically
+                print(f"\n  Scanned projects on page {page_num}:")
+                for p, ts in current_projects.items():
+                    print(f"    {p}: {', '.join(ts)}")
+                print(f"  ↳ Proceeding to process page {page_num}…")
+            
+            if abort:
+                break
 
         with open("results.csv", "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=["page", "unit", "url", "status"])
