@@ -24,13 +24,14 @@ playwright install chromium
 
 ## Every run
 
-1. **Close all Chrome windows**
-2. Double-click `launch_chrome.bat`
-3. Log in to the CRM → navigate to your filtered list → set filters + Available checkbox
-4. Open a terminal here and run:
+1. **Open Chrome** (or keep it already open) and double-click `launch_chrome.bat` to enable remote debugging
+2. Log in to the CRM → navigate to your filtered list → set filters + Available checkbox
+3. Open a terminal here and run:
    ```
    python run.py
    ```
+   
+The script will connect to your existing Chrome session, scan the current page, ask for image folders, then process all pages automatically.
 
 ---
 
@@ -58,23 +59,17 @@ Paths can be **anywhere** on your PC. Paste them in directly (quotes are strippe
 
 ---
 
-## Pagination
+## Pagination (Automatic)
 
-The script only processes the units visible on the current page.
-When a page is done it asks:
+The script processes all units on the current page, then **automatically** advances to the next page by:
+1. Clicking the Next button
+2. Waiting for the page to fully load (URL change → networkidle → freeze-overlay disappears)
+3. Rescanning for NEW unit types (in "different per type" mode)
+4. Processing the new page
 
-```
-  Page 1 complete — 42 OK | 0 failed
-  Browser shows: 1 / 3
+**No manual intervention needed** — the script handles page transitions automatically. It stops when it reaches the last page and saves results to `results.csv`.
 
-  Enter  →  I moved to next page, continue
-  done   →  Finish and save results
-
-  >
-```
-
-You click next page in Chrome yourself, then press Enter.
-Type `done` when all pages are finished.
+If you want to stop early, press `Ctrl+C` in the terminal.
 
 ---
 
@@ -98,19 +93,19 @@ Examples:
 This behavior reduces unnecessary prompts while allowing incremental discovery of new unit types across pages.
 
 
-## Confirmation steps (test mode)
+## Automatic Processing
 
-| Step | What to verify |
-|------|---------------|
-| 1 | New images appeared in Image Manager |
-| 2 | Correct tag (Live Photo) applied |
-| 3 | Image Manager closed cleanly |
-| 4 | Correct price checkbox ticked |
-| 5 | Your images selected in Images tab *(manual for now)* |
-| 6 | Listing looks correct before moving on |
+The script runs fully automated once you provide image folder paths on the first page:
 
-**To go fully automatic:** open `run.py`, search `# ← REMOVE FOR AUTO`, delete those lines.
-Keep STEP 5 until the Images tab DOM is mapped.
+1. **First page**: Scans for unit types → asks for image folders → shows summary → confirms you're ready
+2. **Subsequent pages**: Automatically detects new pages → rescans for new unit types → asks only for new types → processes all units
+3. **Completion**: Stops at last page → saves `results.csv` with all results
+
+**Step-by-step actions per unit (all automatic):**
+- Open unit detail page
+- Check publish status
+- If not published: upload images → tag with 'Live Photo' → open Publish modal → set price display → select images → save
+- Return to list and process next unit
 
 ---
 
@@ -119,9 +114,9 @@ Keep STEP 5 until the Images tab DOM is mapped.
 | Setting | Default | Options |
 |---------|---------|---------|
 | `PRICE_MODE` | `"auto"` | `"auto"` / `"down_payment"` / `"unit_price"` |
-| `DP_THRESHOLD` | `5.0` | % below which auto switches to Unit Price |
+| `DP_THRESHOLD` | `80.0` | % at which auto switches to Unit Price (≥80% = Unit Price) |
 | `IMAGE_TAG` | `"Live Photo"` | Any tag name shown in Image Manager |
-| `UPLOAD_WAIT_MS` | `3500` | Increase if uploads are slow |
+| `SLOW_TIMEOUT` | `300000` | 5 minutes (ms) — timeout for all waits to unpredictable CRM |
 
 ---
 
