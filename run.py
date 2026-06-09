@@ -282,7 +282,7 @@ def scan_projects_types(page: Page) -> dict:
 
     for i in range(total):
         try:
-            card_text = cards.nth(i).inner_text().strip()
+            card_text = cards.nth(i).locator("h5.card-title").inner_text().strip()
             title = card_text.split("\n")[0].strip()
             if not title:
                 title = cards.nth(i).locator("h5.card-title").inner_text().strip()
