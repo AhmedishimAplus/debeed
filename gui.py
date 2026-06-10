@@ -84,6 +84,7 @@ class DebeedApp:
         self._build_ui()
         self._patch_io()
         self._poll()
+        self.root.after(300, self._ensure_chrome_path)
 
     # ═══════════════════════════════════════════════════════════════
     #  UI CONSTRUCTION
@@ -535,6 +536,24 @@ class DebeedApp:
         self._response_q.put(value)
         self._wait_evt.set()
         self._panel_running()
+
+    def _ensure_chrome_path(self):
+        try:
+            from _exe_setup import get_chrome_path
+        except ImportError:
+            return
+        path = get_chrome_path()
+        if path:
+            self._status_var.set("Ready  —  click Start to begin")
+        else:
+            self._status_var.set("Chrome not set  —  reopen app to choose it")
+            messagebox.showwarning(
+                "Chrome Not Found",
+                "Chrome could not be located automatically.\n\n"
+                "You can still click Start — but if Chrome doesn't open, "
+                "close and reopen the app to select chrome.exe manually.",
+                parent=self.root,
+            )
 
     def _start(self):
         if self._started:

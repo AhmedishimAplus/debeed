@@ -18,6 +18,8 @@ SETUP (one-time):
   Launch Chrome via launch_chrome.bat, log in, navigate to filtered list.
 """
 
+from _exe_setup import setup, launch_chrome
+setup()
 import re, csv, random, sys, builtins
 from datetime import datetime
 from pathlib import Path
@@ -1268,13 +1270,21 @@ def main():
     print("  EGY Property Automation")
     print("═"*50)
 
+    print("\n  Launching Chrome…")
+    if not launch_chrome():
+        print("\n❌  Could not start Chrome.")
+        print("    Make sure Google Chrome is installed, then run again.\n")
+        input("  Press Enter to exit… ")
+        return
+
     with sync_playwright() as p:
         try:
             browser = p.chromium.connect_over_cdp("http://localhost:9222")
         except Exception:
-            print("\n❌  Cannot connect to Chrome.")
-            print("    Launch it first with launch_chrome.bat\n")
-            raise
+            print("\n❌  Could not connect to Chrome.")
+            print("    Close ALL Chrome windows and try again.\n")
+            input("  Press Enter to exit… ")
+            return
 
         ctx  = browser.contexts[0]
         page = ctx.pages[0]

@@ -5,3 +5,24 @@
 /logs
 /HANDOFF.md
 /.claude
+build/
+dist/
+*.spec
+
+# Python bytecode cache (auto-generated)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs created by the app at runtime
+logs/
+
+
+# Editor / OS clutter
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude Code local folder (delete this line to commit .claude files)
+.claude/
