@@ -1408,6 +1408,28 @@ def main():
             except Exception:
                 pass
 
+            # CRM bug: before the last page, clicking Next loads an empty page.
+            # Fix: click Back, wait for cards — the CRM renders the remaining units
+            # on the previous page. No second Next needed; just scan what's there.
+            if page.locator("div.card.cursor-pointer.rounded-0").count() == 0:
+                print("  ⚠ Page appears empty (CRM bug) — clicking Back to reload…")
+                try:
+                    back_btn = page.locator("button.btn-icon:has(i.fa-angle-left)").last
+                    back_btn.click(timeout=SLOW_TIMEOUT)
+                    try:
+                        page.wait_for_selector(".freeze-message-container", state="hidden", timeout=SLOW_TIMEOUT)
+                    except Exception:
+                        pass
+                    page.wait_for_load_state("networkidle", timeout=SLOW_TIMEOUT)
+                    page.wait_for_selector("div.card.cursor-pointer.rounded-0", state="visible", timeout=SLOW_TIMEOUT)
+                    try:
+                        page_num = int(page.locator("input[type='number']").last.input_value().strip())
+                    except Exception:
+                        page_num = cur
+                    print(f"  ✓ Back done — page {page_num} loaded with cards. Scanning…")
+                except Exception as e:
+                    print(f"  ⚠ Back reload failed: {e}")
+
             # ═══════════════════════════════════════════════════════════════
             #  PAGE FULLY LOADED — NOW SCAN FOR PROJECTS/TYPES
             # ═══════════════════════════════════════════════════════════════
