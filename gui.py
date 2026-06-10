@@ -5,31 +5,33 @@ Run this file instead of run.py.
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import ttk, filedialog, messagebox
 import threading
 import queue
 import builtins
 import sys
 import re
 import io
+import csv as _csv_mod
+import shutil
 from pathlib import Path
 from datetime import datetime
 
-# ── Patch run.setup_run_logging BEFORE importing run ─────────────
-# run.setup_run_logging replaces builtins.input and sys.stdout.
-# We handle both ourselves, so we swap it out for a lightweight version
-# that only opens the log file.
+# ── Module-level log state ─────────────────────────────────────────
 _log_file = None
+_log_path = None
 
 def _gui_setup_logging():
-    global _log_file
+    global _log_file, _log_path
     Path("logs").mkdir(exist_ok=True)
-    log_path = Path("logs") / f"run_{datetime.now():%Y%m%d_%H%M%S}.txt"
-    _log_file = open(log_path, "a", encoding="utf-8", buffering=1)
-    print(f"  Logging to: {log_path}")
+    _log_path = Path("logs") / f"run_{datetime.now():%Y%m%d_%H%M%S}.txt"
+    _log_file = open(_log_path, "a", encoding="utf-8", buffering=1)
+    print(f"  Logging to: {_log_path}")
 
 import run as _run
 _run.setup_run_logging = _gui_setup_logging
+_run._GUI_MODE        = True
+_run._pending_results = None
 
 # ── Colour palette ─────────────────────────────────────────────────
 BG_MAIN    = "#0d1b2a"
@@ -68,19 +70,20 @@ class DebeedApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Queues — automation thread <-> GUI main thread
-        self._log_q      = queue.Queue()   # (kind, payload)
-        self._input_q    = queue.Queue()   # (type, prompt)
-        self._response_q = queue.Queue()   # str responses back to automation
+        self._log_q      = queue.Queue()
+        self._input_q    = queue.Queue()
+        self._response_q = queue.Queue()
         self._wait_evt   = threading.Event()
 
         # Runtime state
-        self._started               = False
-        self._pending_folder        = ""
-        self._pending_folder_valid  = False
+        self._started              = False
+        self._pending_folder       = ""
+        self._pending_folder_valid = False
+        self._log_cleaned          = False
 
         self._build_ui()
         self._patch_io()
-        self._poll()  # start queue polling loop
+        self._poll()
 
     # ═══════════════════════════════════════════════════════════════
     #  UI CONSTRUCTION
@@ -107,7 +110,6 @@ class DebeedApp:
                  bg=BG_PANEL, fg=FG_MUTED,
                  font=("Segoe UI", 8)).pack(side=tk.RIGHT, padx=20)
 
-        # Separator line
         tk.Frame(self.root, bg=BORDER, height=1).pack(fill=tk.X)
 
         # ── Gold progress bar ────────────────────────────────────────
@@ -155,7 +157,6 @@ class DebeedApp:
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self._log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Text colour tags
         self._log.tag_config("ts",      foreground="#2a4560", font=("Consolas", 8))
         self._log.tag_config("success", foreground=FG_SUCCESS)
         self._log.tag_config("error",   foreground=FG_ERROR)
@@ -167,12 +168,51 @@ class DebeedApp:
         self._log.tag_config("normal",  foreground=FG_TEXT)
         self._log.tag_config("done",    foreground=FG_SUCCESS, font=("Consolas", 9, "bold"))
 
-        # ── Action panel (bottom) ────────────────────────────────────
+        # ── Action panel ─────────────────────────────────────────────
         self._action = tk.Frame(self.root, bg=BG_ACTION,
                                 highlightthickness=1,
                                 highlightbackground=BORDER)
-        self._action.pack(fill=tk.X, padx=14, pady=(0, 12))
+        self._action.pack(fill=tk.X, padx=14, pady=(0, 4))
         self._panel_start()
+
+        # ── Bottom button bar ─────────────────────────────────────────
+        self._build_btn_bar()
+
+    def _build_btn_bar(self):
+        bar = tk.Frame(self.root, bg=BG_MAIN)
+        bar.pack(fill=tk.X, padx=14, pady=(0, 10))
+
+        # Left group — log save always visible; results revealed on completion
+        self._btn_left = tk.Frame(bar, bg=BG_MAIN)
+        self._btn_left.pack(side=tk.LEFT)
+
+        tk.Button(self._btn_left,
+                  text="📥  Save Log",
+                  bg=BTN_BLUE_BG, fg=BTN_BLUE_FG,
+                  font=("Segoe UI", 9, "bold"),
+                  relief=tk.FLAT, padx=12, pady=5,
+                  cursor="hand2",
+                  command=self._save_log,
+                  ).pack(side=tk.LEFT)
+
+        # Created but not packed — shown only after completion
+        self._btn_results = tk.Button(self._btn_left,
+                                      text="📊  Save Results",
+                                      bg=BTN_CONT_BG, fg=BTN_CONT_FG,
+                                      font=("Segoe UI", 9, "bold"),
+                                      relief=tk.FLAT, padx=12, pady=5,
+                                      cursor="hand2",
+                                      command=self._save_results)
+
+        # Right — always visible quit
+        tk.Button(bar,
+                  text="✕  Quit",
+                  bg=BTN_NO_BG, fg=BTN_NO_FG,
+                  font=("Segoe UI", 9, "bold"),
+                  relief=tk.FLAT, padx=12, pady=5,
+                  cursor="hand2",
+                  command=self._quit,
+                  ).pack(side=tk.RIGHT)
 
     # ═══════════════════════════════════════════════════════════════
     #  ACTION PANELS
@@ -182,7 +222,6 @@ class DebeedApp:
         for w in self._action.winfo_children():
             w.destroy()
 
-    # ── Start panel ─────────────────────────────────────────────────
     def _panel_start(self):
         self._clear()
         f = tk.Frame(self._action, bg=BG_ACTION)
@@ -204,7 +243,6 @@ class DebeedApp:
                   command=self._start,
                   ).pack(side=tk.RIGHT)
 
-    # ── Automation running (idle panel between prompts) ─────────────
     def _panel_running(self, message="Automation running  —  waiting for next action…"):
         self._clear()
         f = tk.Frame(self._action, bg=BG_ACTION)
@@ -213,19 +251,16 @@ class DebeedApp:
                  bg=BG_ACTION, fg=FG_SUCCESS,
                  font=("Segoe UI", 10)).pack(side=tk.LEFT)
 
-    # ── SCENARIO 1: Yes / No ─────────────────────────────────────────
     def _panel_yes_no(self, prompt: str):
         self._clear()
         f = tk.Frame(self._action, bg=BG_ACTION)
         f.pack(fill=tk.X, padx=20, pady=14)
 
-        # Clean prompt text
         clean = re.sub(r"\(y/n\):?", "", prompt, flags=re.IGNORECASE).strip()
         clean = clean.strip().rstrip(":").strip()
         if not clean.endswith("?"):
             clean += "?"
 
-        # Derive contextual button labels
         pl = prompt.lower()
         if "same images" in pl:
             yes_label = "✓  Yes, same images for all"
@@ -268,7 +303,6 @@ class DebeedApp:
                   command=lambda: self._respond("y"),
                   ).pack(side=tk.RIGHT, padx=(8, 0))
 
-    # ── SCENARIO 2: Folder path browser ─────────────────────────────
     def _panel_folder(self, prompt: str):
         self._clear()
         self._pending_folder       = ""
@@ -288,7 +322,7 @@ class DebeedApp:
 
         path_var   = tk.StringVar(value="No folder selected")
         status_var = tk.StringVar(value="")
-        _confirm   = []   # holds reference to confirm button after creation
+        _confirm   = []
 
         def browse():
             folder = filedialog.askdirectory(title="Select Image Folder", mustexist=True)
@@ -344,7 +378,6 @@ class DebeedApp:
         confirm_btn.pack(side=tk.RIGHT)
         _confirm.append(confirm_btn)
 
-    # ── SCENARIO 3: Continue / Enter ────────────────────────────────
     def _panel_continue(self, prompt: str):
         self._clear()
         f = tk.Frame(self._action, bg=BG_ACTION)
@@ -355,7 +388,6 @@ class DebeedApp:
         color  = FG_WARNING if is_err else FG_INFO
         icon   = "⚠" if is_err else "ℹ"
 
-        # Clean up common boilerplate tails
         clean = prompt.strip()
         for tail in ("Press Enter when ready…", "press Enter to continue…",
                      "then press Enter to continue…", "Press Enter when ready",
@@ -379,26 +411,127 @@ class DebeedApp:
                   command=lambda: self._respond(""),
                   ).pack(side=tk.RIGHT)
 
-    # ── Complete panel ───────────────────────────────────────────────
     def _panel_complete(self):
         self._clear()
         f = tk.Frame(self._action, bg=BG_ACTION)
         f.pack(fill=tk.X, padx=20, pady=14)
         tk.Label(f,
-                 text="✅  All units processed successfully.   "
-                      "Check  results.csv  for the full report.",
+                 text="✅  All units processed.  Use the buttons below to save results and log.",
                  bg=BG_ACTION, fg=FG_SUCCESS,
                  font=("Segoe UI", 11, "bold"),
                  ).pack(side=tk.LEFT)
         self._status_var.set("Complete")
         self._prog["value"] = 100
 
+        # Reveal results download button
+        self._btn_results.pack(side=tk.LEFT, padx=(8, 0))
+
+        # Ask about log after UI renders
+        self.root.after(1500, self._ask_keep_log)
+
+    # ═══════════════════════════════════════════════════════════════
+    #  FILE SAVE & CLEANUP
+    # ═══════════════════════════════════════════════════════════════
+
+    def _save_log(self):
+        if _log_file:
+            try:
+                _log_file.flush()
+            except Exception:
+                pass
+
+        init_name = _log_path.name if _log_path else "debeed_log.txt"
+        dst = filedialog.asksaveasfilename(
+            title="Save Activity Log",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            initialfile=init_name,
+            parent=self.root,
+        )
+        if not dst:
+            return
+
+        try:
+            if _log_path and _log_path.exists():
+                shutil.copy2(str(_log_path), dst)
+            else:
+                # Log file not started yet — save widget content
+                content = self._log.get("1.0", tk.END)
+                Path(dst).write_text(content, encoding="utf-8")
+            self._append_log(f"  💾  Log saved → {dst}\n")
+        except Exception as e:
+            messagebox.showerror("Save Failed", f"Could not save log:\n{e}", parent=self.root)
+
+    def _save_results(self):
+        results = getattr(_run, '_pending_results', None)
+        if not results:
+            messagebox.showinfo("No Results", "No results available yet.", parent=self.root)
+            return
+
+        dst = filedialog.asksaveasfilename(
+            title="Save Results",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile="results.csv",
+            parent=self.root,
+        )
+        if not dst:
+            return
+
+        try:
+            with open(dst, "w", newline="", encoding="utf-8") as f:
+                w = _csv_mod.DictWriter(f, fieldnames=["page", "unit", "url", "status"])
+                w.writeheader()
+                w.writerows(results)
+            self._btn_results.config(state=tk.DISABLED, text="✓  Results saved")
+            self._append_log(f"  📄  Results saved → {dst}\n")
+        except Exception as e:
+            messagebox.showerror("Save Failed", f"Could not save results:\n{e}", parent=self.root)
+
+    def _ask_keep_log(self):
+        keep = messagebox.askyesno(
+            "Save Activity Log?",
+            "Automation complete.\n\n"
+            "Would you like to save the activity log?\n"
+            "(If you already used the Save Log button, click No.)",
+            parent=self.root,
+        )
+        if keep:
+            self._save_log()
+        self._cleanup_log()
+        self._log_cleaned = True
+
+    def _cleanup_log(self):
+        global _log_file
+        if _log_file:
+            try:
+                _log_file.close()
+            except Exception:
+                pass
+            _log_file = None
+        if _log_path and _log_path.exists():
+            try:
+                _log_path.unlink()
+            except Exception:
+                pass
+
+    def _quit(self):
+        if self._started and not self._log_cleaned:
+            if not messagebox.askyesno(
+                "Quit",
+                "Automation may still be running.\n\n"
+                "Quit anyway? Unsaved logs will be deleted.",
+                parent=self.root,
+            ):
+                return
+        self._cleanup_log()
+        self.root.destroy()
+
     # ═══════════════════════════════════════════════════════════════
     #  RESPONSE & AUTOMATION THREAD
     # ═══════════════════════════════════════════════════════════════
 
     def _respond(self, value: str):
-        """User clicked a button — send value back to automation thread."""
         self._response_q.put(value)
         self._wait_evt.set()
         self._panel_running()
@@ -427,7 +560,6 @@ class DebeedApp:
     def _patch_io(self):
         app = self
 
-        # ── stdout / stderr → log queue ──────────────────────────────
         class GUIStream:
             def write(self, text):
                 if text:
@@ -448,7 +580,6 @@ class DebeedApp:
         sys.stdout = GUIStream()
         sys.stderr = GUIStream()
 
-        # ── builtins.input → GUI panels ──────────────────────────────
         def gui_input(prompt: str = "") -> str:
             if _log_file and prompt:
                 try:
@@ -510,7 +641,7 @@ class DebeedApp:
             return "muted"
         if s.startswith(("↳", "→ ", "↩")):
             return "info"
-        if s.startswith("["):  # [DEBUG] lines
+        if s.startswith("["):
             return "muted"
         return "normal"
 
@@ -530,7 +661,6 @@ class DebeedApp:
         self._log.see(tk.END)
         self._log.config(state=tk.DISABLED)
 
-        # Update unit counter from [X/Y] patterns
         m = re.search(r"\[(\d+)/(\d+)\]", text)
         if m:
             done, total = int(m.group(1)), int(m.group(2))
@@ -544,7 +674,6 @@ class DebeedApp:
     # ═══════════════════════════════════════════════════════════════
 
     def _poll(self):
-        # Drain log messages
         try:
             while True:
                 kind, payload = self._log_q.get_nowait()
@@ -555,7 +684,6 @@ class DebeedApp:
         except queue.Empty:
             pass
 
-        # Show input panel if automation is waiting for one
         try:
             kind, prompt = self._input_q.get_nowait()
             if kind == "yes_no":
@@ -574,12 +702,7 @@ class DebeedApp:
     # ═══════════════════════════════════════════════════════════════
 
     def _on_close(self):
-        if _log_file:
-            try:
-                _log_file.close()
-            except Exception:
-                pass
-        self.root.destroy()
+        self._quit()
 
     def run(self):
         self.root.mainloop()

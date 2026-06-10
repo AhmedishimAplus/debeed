@@ -1468,16 +1468,22 @@ def main():
             if abort:
                 break
 
-        with open("results.csv", "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["page", "unit", "url", "status"])
-            w.writeheader()
-            w.writerows(results)
+        # Store results for GUI export; write CSV only when running standalone
+        _mod = sys.modules.get('run') or sys.modules.get(__name__)
+        if _mod is not None:
+            _mod._pending_results = list(results)
+
+        if not getattr(_mod, '_GUI_MODE', False):
+            with open("results.csv", "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=["page", "unit", "url", "status"])
+                w.writeheader()
+                w.writerows(results)
+            print(f"  📄  results.csv saved")
 
         total_ok   = sum(1 for r in results if r["status"] == "OK")
         total_fail = len(results) - total_ok
         print(f"\n{'═'*50}")
         print(f"  ✅  All done!  {total_ok} OK  |  {total_fail} failed")
-        print(f"  📄  results.csv saved")
         print(f"{'═'*50}\n")
 
 if __name__ == "__main__":
