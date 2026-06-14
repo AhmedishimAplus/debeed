@@ -228,10 +228,16 @@ class DebeedApp:
         f = tk.Frame(self._action, bg=BG_ACTION)
         f.pack(fill=tk.X, padx=20, pady=14)
 
+        import platform as _plat
+        _step1 = (
+            "1.  Click  Start  below — Chrome will open automatically\n"
+            if _plat.system() == "Darwin" else
+            "1.  Open  launch_chrome.bat  and wait for Chrome to launch\n"
+        )
         tk.Label(f,
-                 text="1.  Open  launch_chrome.bat  and wait for Chrome to launch\n"
-                      "2.  Log in to the CRM and navigate to your filtered unit list\n"
-                      "3.  Apply filters, tick  Available,  then click  Start  below",
+                 text=_step1
+                      + "2.  Log in to the CRM and navigate to your filtered unit list\n"
+                        "3.  Apply filters, tick  Available,  then click  Start  below",
                  bg=BG_ACTION, fg=FG_TEXT,
                  font=("Segoe UI", 10), justify=tk.LEFT,
                  ).pack(side=tk.LEFT, padx=(0, 24))

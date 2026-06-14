@@ -1,12 +1,16 @@
-# EGY Property Automation
+# EGY Property Automation — Debeed
 
 ## Files
 
 ```
-egyprop_automation/
-  run.py              ← main script
-  launch_chrome.bat   ← opens Chrome with debugging enabled
-  results.csv         ← created after each run
+run.py             ← automation logic
+gui.py             ← Tkinter GUI (entry point — run this)
+_exe_setup.py      ← Chrome auto-launch + PyInstaller path helpers (do not edit)
+build.bat          ← builds dist\Debeed.exe (do not edit)
+Debeed.spec        ← PyInstaller spec (do not edit)
+launch_chrome.bat  ← kept for reference, no longer needed
+results.csv        ← created after each run
+logs\              ← per-run log files (auto-created)
 ```
 
 No image folder structure required — images can live anywhere on your PC.
@@ -22,35 +26,47 @@ playwright install chromium
 
 ---
 
-## Every run
+## Every run (GUI)
 
-1. **Open Chrome** (or keep it already open) and double-click `launch_chrome.bat` to enable remote debugging
+```
+python gui.py
+```
+
+1. Window opens — Chrome launches **automatically** (no `.bat` needed)
 2. Log in to the CRM → navigate to your filtered list → set filters + Available checkbox
-3. Open a terminal here and run:
-   ```
-   python run.py
-   ```
-   
-The script will connect to your existing Chrome session, scan the current page, ask for image folders, then process all pages automatically.
+3. Click **▶ Start** in the GUI
+
+---
+
+## Every run (terminal / headless)
+
+```
+python run.py
+```
+
+Chrome still launches automatically. Follow on-screen prompts.
 
 ---
 
 ## What happens at startup
 
 ```
-Script scans the page → finds unit types (e.g. Apartment, Villa, Loft)
+Script scans the page → finds projects and unit types
 
-Same images for ALL types? (y/n): n
+Project: Solana West  —  2 type(s): Apartment, Villa
 
-  Folder path for [Apartment]: C:\Users\Ahmed\Desktop\Resale Tasks\solana west\apartments
+  For project 'Solana West': Same images for ALL types? (y/n): n
+
+  Folder path for [Solana West -> Apartment]: C:\Users\Ahmed\Desktop\apartments
   ✓ 6 image(s) found
 
-  Folder path for [Villa]: C:\Users\Ahmed\Desktop\Resale Tasks\solana west\villas
+  Folder path for [Solana West -> Villa]: C:\Users\Ahmed\Desktop\villas
   ✓ 6 image(s) found
 
   IMAGE MAPPING SUMMARY
-  Apartment  →  6 image(s)  from  C:\...\apartments
-  Villa      →  6 image(s)  from  C:\...\villas
+  Solana West  (per type)
+    Apartment  →  6 image(s)  from  C:\...\apartments
+    Villa      →  6 image(s)  from  C:\...\villas
 
   Look good? Start? (y/n): y
 ```
@@ -61,51 +77,43 @@ Paths can be **anywhere** on your PC. Paste them in directly (quotes are strippe
 
 ## Pagination (Automatic)
 
-The script processes all units on the current page, then **automatically** advances to the next page by:
-1. Clicking the Next button
-2. Waiting for the page to fully load (URL change → networkidle → freeze-overlay disappears)
-3. Rescanning for NEW unit types (in "different per type" mode)
-4. Processing the new page
+Script processes all units on current page, then **automatically** advances by:
+1. Clicking Next button
+2. Waiting for page to fully load (URL change → networkidle → freeze-overlay gone)
+3. Rescanning for NEW projects/types
+4. Processing new page
 
-**No manual intervention needed** — the script handles page transitions automatically. It stops when it reaches the last page and saves results to `results.csv`.
-
-If you want to stop early, press `Ctrl+C` in the terminal.
+Stops at last page, saves `results.csv`. To stop early press `Ctrl+C` in terminal (or close GUI window).
 
 ---
 
-## Persistent Mapping (NEW in v2)
+## Image mapping modes
 
-The script supports two modes for providing image folders. Your initial choice on Page 1 controls behavior for subsequent pages:
+**Same images for ALL types (y):**
+Provide one folder per project on Page 1 → reused for every unit on every page. Zero prompts after.
 
-- **Same images for ALL types (y):** You provide one folder set on Page 1 and the script will reuse that same set for every unit on every page. The script will *not* rescan subsequent pages or prompt again — pure automation after Page 1.
-- **Different images per type (n):** You provide folders per type on Page 1. On subsequent pages the script *rescans* for unit types and will only prompt you for *new* types that were not previously mapped. Known types are reused silently.
+**Different images per type (n):**
+Provide folders per type on Page 1. On later pages only NEW types (not yet mapped) trigger a prompt. Known types reuse silently.
 
 Examples:
 
-1. Same images mode (y):
-  - Page 1: supply folder A → All units on all pages use folder A (no more prompts).
+| Mode | Page 1 | Page 2 | Page 3 |
+|------|--------|--------|--------|
+| Same (y) | Supply folder A | No prompt | No prompt |
+| Per type (n) | Apartment ✓, Villa ✓ | Twinhouse ❌ → ask once | Any newer types ❌ → ask once |
 
-2. Different images mode (n):
-  - Page 1: supply folders for Apartment, Villa
-  - Page 2: scan finds Apartment (saved), Villa (saved), Twinhouse (new) → script asks only for Twinhouse path
-  - Page 3+: any new types detected will be requested once and then remembered
+---
 
-This behavior reduces unnecessary prompts while allowing incremental discovery of new unit types across pages.
+## Per-unit flow (fully automatic)
 
-
-## Automatic Processing
-
-The script runs fully automated once you provide image folder paths on the first page:
-
-1. **First page**: Scans for unit types → asks for image folders → shows summary → confirms you're ready
-2. **Subsequent pages**: Automatically detects new pages → rescans for new unit types → asks only for new types → processes all units
-3. **Completion**: Stops at last page → saves `results.csv` with all results
-
-**Step-by-step actions per unit (all automatic):**
-- Open unit detail page
-- Check publish status
-- If not published: upload images → tag with 'Live Photo' → open Publish modal → set price display → select images → save
-- Return to list and process next unit
+1. Open unit detail page
+2. Check publish status dot
+   - **Red** → proceed with upload & publish
+   - **Green / faded** → already published, skip
+   - **Disabled** → cannot publish (duplicate), skip
+3. Open Image Manager → upload images (order randomized) → tag as `Live Photo`
+4. Open Publish Unit modal → auto-select price display (Down Payment vs Unit Price) → select images → check Published → Save
+5. Go back to list → next unit
 
 ---
 
@@ -114,9 +122,19 @@ The script runs fully automated once you provide image folder paths on the first
 | Setting | Default | Options |
 |---------|---------|---------|
 | `PRICE_MODE` | `"auto"` | `"auto"` / `"down_payment"` / `"unit_price"` |
-| `DP_THRESHOLD` | `80.0` | % at which auto switches to Unit Price (≥80% = Unit Price) |
+| `DP_THRESHOLD` | `80.0` | % at which auto switches to Unit Price (≥80% or DP=0 → Unit Price) |
 | `IMAGE_TAG` | `"Live Photo"` | Any tag name shown in Image Manager |
-| `SLOW_TIMEOUT` | `300000` | 5 minutes (ms) — timeout for all waits to unpredictable CRM |
+| `SLOW_TIMEOUT` | `300000` | 5 min (ms) — timeout for all CRM waits |
+
+---
+
+## Building the .exe
+
+Double-click `build.bat`. Wait 3–7 minutes.
+
+Output: `dist\Debeed.exe`
+
+Ship **only** `dist\Debeed.exe` to users. They need Google Chrome installed; they do **not** need Python.
 
 ---
 

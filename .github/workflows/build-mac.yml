@@ -1,0 +1,42 @@
+name: Build Mac App
+
+on:
+  workflow_dispatch:   # Run manually from GitHub → Actions tab
+
+jobs:
+  build-mac:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install playwright pyinstaller
+
+      - name: Build .app
+        run: |
+          pyinstaller \
+            --windowed \
+            --name "EGYProperty" \
+            --collect-all playwright \
+            --hidden-import tkinter \
+            --hidden-import _tkinter \
+            gui.py
+
+      - name: Fix driver permissions
+        run: |
+          find dist/EGYProperty.app -name "playwright" ! -name "*.py" -exec chmod +x {} \;
+
+      - name: Zip for download
+        run: cd dist && zip -r ../EGYProperty-mac.zip EGYProperty.app
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EGYProperty-mac
+          path: EGYProperty-mac.zip
+          retention-days: 30

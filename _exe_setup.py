@@ -51,10 +51,22 @@ def setup():
     if not getattr(sys, 'frozen', False):
         return  # Running as .py file — nothing to fix
 
-    browsers_path = os.path.join(
-        os.path.expanduser('~'),
-        'AppData', 'Local', 'ms-playwright'
-    )
+    system = platform.system()
+    if system == "Darwin":
+        browsers_path = os.path.join(
+            os.path.expanduser('~'),
+            'Library', 'Caches', 'ms-playwright'
+        )
+    elif system == "Windows":
+        browsers_path = os.path.join(
+            os.path.expanduser('~'),
+            'AppData', 'Local', 'ms-playwright'
+        )
+    else:
+        browsers_path = os.path.join(
+            os.path.expanduser('~'),
+            '.cache', 'ms-playwright'
+        )
     os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH', browsers_path)
 
     if hasattr(sys, '_MEIPASS'):
@@ -254,6 +266,38 @@ def change_chrome_path() -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# BROWSER AUTO-INSTALL — First launch of compiled .app only
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ensure_playwright_browser():
+    """Install Chromium using the bundled driver if not already present."""
+    browsers_path = os.environ.get('PLAYWRIGHT_BROWSERS_PATH', '')
+    driver_dir    = os.environ.get('PLAYWRIGHT_DRIVER_PATH', '')
+    if not browsers_path or not driver_dir:
+        return
+
+    # Already installed?
+    if os.path.isdir(browsers_path):
+        try:
+            if any(e.lower().startswith('chromium') for e in os.listdir(browsers_path)):
+                return
+        except Exception:
+            return
+
+    driver_exec = os.path.join(driver_dir, 'playwright')
+    if not os.path.isfile(driver_exec):
+        return
+
+    print("  First launch: installing browser engine (~1 minute)…")
+    try:
+        env = {**os.environ, 'PLAYWRIGHT_BROWSERS_PATH': browsers_path}
+        subprocess.run([driver_exec, 'install', 'chromium'], env=env, timeout=300)
+        print("  ✓ Browser engine ready")
+    except Exception as e:
+        print(f"  ⚠ Browser install failed: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # LAUNCH CHROME — Replaces launch_chrome.bat
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -272,6 +316,9 @@ def launch_chrome(port: int = 9222, headless: bool = False) -> bool:
     # Already running with debugging on? Reuse it.
     if _is_port_open('127.0.0.1', port):
         return True
+
+    if getattr(sys, 'frozen', False):
+        _ensure_playwright_browser()
 
     chrome_path = get_chrome_path()
     if not chrome_path:
