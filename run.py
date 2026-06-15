@@ -1312,6 +1312,31 @@ def main():
     print("  EGY Property Automation")
     print("═"*50)
 
+    print("\n" + "─"*50)
+    print("  PLEASE NOTE")
+    print("─"*50)
+    print(
+        "  • When asked “Same images for all types?” — clicking Yes asks\n"
+        "    you for one folder and uses that same set of images for every\n"
+        "    unit type. Clicking No asks you for a separate folder per unit\n"
+        "    type (per project) and uses each set only for that type. When\n"
+        "    the program moves to the next page it scans for new types per\n"
+        "    project, and if a new type is found it asks you for a new path\n"
+        "    for it."
+    )
+    print(
+        "  • Sometimes the CRM fails to read some images, causing an error\n"
+        "    on its side. The program only checks the first upload per type\n"
+        "    — if that first upload passes, no further errors will occur for\n"
+        "    that type. If an error does occur, you are asked whether to\n"
+        "    continue without the failed image(s): clicking Yes omits the\n"
+        "    faulty image(s); clicking No shows you the path of each faulty\n"
+        "    image so you can find and delete it, then asks you for a new\n"
+        "    path for that project. This can also happen when you choose\n"
+        "    “same images for all.”"
+    )
+    print("─"*50)
+
     print("\n  Launching Chrome…")
     if not launch_chrome():
         print("\n❌  Could not start Chrome.")

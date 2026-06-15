@@ -228,18 +228,16 @@ class DebeedApp:
         f = tk.Frame(self._action, bg=BG_ACTION)
         f.pack(fill=tk.X, padx=20, pady=14)
 
-        import platform as _plat
-        _step1 = (
-            "1.  Click  Start  below — Chrome will open automatically\n"
-            if _plat.system() == "Darwin" else
-            "1.  Open  launch_chrome.bat  and wait for Chrome to launch\n"
+        instructions = (
+            "1.  Please make sure the CRM tab is the one and only tab open — do not open additional tabs.\n"
+            "2.  Log in to the CRM and navigate to your filtered unit list.\n"
+            "3.  Apply filters, tick  Available,  then click  Start  below."
         )
         tk.Label(f,
-                 text=_step1
-                      + "2.  Log in to the CRM and navigate to your filtered unit list\n"
-                        "3.  Apply filters, tick  Available,  then click  Start  below",
+                 text=instructions,
                  bg=BG_ACTION, fg=FG_TEXT,
                  font=("Segoe UI", 10), justify=tk.LEFT,
+                 wraplength=640,
                  ).pack(side=tk.LEFT, padx=(0, 24))
 
         tk.Button(f, text="▶  Start",
