@@ -35,6 +35,11 @@ IMAGE_TAG      = "Live Photo"
 UPLOAD_WAIT_MS = 3500
 SLOW_TIMEOUT   = 300_000    # 5 minutes - used for unpredictable slow CRM responses
 
+# Active workspace tab, set at runtime in main(): "Re-Sale" | "Rent" | "Primary".
+# Re-Sale is the default and original behaviour. Rent reuses the entire flow but
+# skips the price/down-payment logic in step_publish (no price decision needed).
+CURRENT_VIEW   = "Re-Sale"
+
 
 class Tee:
     def __init__(self, *streams):
@@ -244,6 +249,34 @@ def extract_unit_cards_from_text(page: Page) -> list:
         cards.append(current)
 
     return cards
+
+# ═══════════════════════════════════════════════════════════════════
+#  DETECT ACTIVE WORKSPACE TAB  (Re-Sale vs Rent vs Primary)
+# ═══════════════════════════════════════════════════════════════════
+def detect_active_view(page: Page) -> str:
+    """Return which workspace tab is active: 'Rent', 'Re-Sale', 'Primary', or 'unknown'.
+
+    Identity anchored on the route href (stable even if labels are translated).
+    State signal preference: aria-current="page" → 'exact-active' class → URL path.
+    """
+    try:
+        current_href = page.evaluate(
+            """() => {
+                const activeLink = document.querySelector('a[aria-current="page"], a.exact-active');
+                return (activeLink && activeLink.getAttribute('href')) || location.pathname;
+            }"""
+        )
+    except Exception:
+        current_href = page.url
+
+    href = current_href or ""
+    if "rent-unit" in href:
+        return "Rent"
+    if "resale-unit" in href:
+        return "Re-Sale"
+    if "primary-projects" in href:
+        return "Primary"
+    return "unknown"
 
 # ═══════════════════════════════════════════════════════════════════
 #  SCAN PAGE → UNIQUE UNIT TYPES
@@ -944,6 +977,7 @@ def step_publish(page: Page, n_images: int):
     print("\n   ── STEP 2: Publish Unit ──")
 
     MODAL = ".modal-mask"
+    is_rent = (CURRENT_VIEW == "Rent")
 
     # ── Open modal ─────────────────────────────────────────────────
     print("   ↳ Opening Publish Unit (Clients) modal...")
@@ -953,47 +987,52 @@ def step_publish(page: Page, n_images: int):
     print("   ✓ Modal open")
 
     # ── Price display (Fields tab is default) ──────────────────────
-    UNIT_PRICE_CB   = f"{MODAL} label.price-display__option:first-child input[type='checkbox']"
-    DOWN_PAYMENT_CB = f"{MODAL} label.price-display__option:last-child input[type='checkbox']"
-
-    choice = decide_price(page)
-    print(f"   ↳ Choice made: {choice}")
-
-    up_checked = page.locator(UNIT_PRICE_CB).is_checked()
-    dp_checked = page.locator(DOWN_PAYMENT_CB).is_checked()
-    print(f"   ↳ Current state: Unit Price={up_checked}  |  Down Payment={dp_checked}")
-
-    if choice == "down_payment":
-        print(f"   ↳ Setting to: Down Payment")
-        if page.locator(UNIT_PRICE_CB).is_checked():
-            page.locator(UNIT_PRICE_CB).click()
-            page.wait_for_function(
-                f"""() => {{
-                    const el = document.querySelector({UNIT_PRICE_CB!r});
-                    return el ? !el.checked : false;
-                }}""",
-                timeout=SLOW_TIMEOUT,
-            )
-        if not page.locator(DOWN_PAYMENT_CB).is_checked():
-            page.locator(DOWN_PAYMENT_CB).click()
+    # Rent units have no selling-price / down-payment decision, so skip the
+    # whole price-display logic and go straight to image selection.
+    if is_rent:
+        print("   ↳ Rent unit — skipping price/down-payment logic")
     else:
-        print(f"   ↳ Setting to: Unit Price")
-        if page.locator(DOWN_PAYMENT_CB).is_checked():
-            page.locator(DOWN_PAYMENT_CB).click()
-            page.wait_for_function(
-                f"""() => {{
-                    const el = document.querySelector({DOWN_PAYMENT_CB!r});
-                    return el ? !el.checked : false;
-                }}""",
-                timeout=SLOW_TIMEOUT,
-            )
-        if not page.locator(UNIT_PRICE_CB).is_checked():
-            page.locator(UNIT_PRICE_CB).click()
+        UNIT_PRICE_CB   = f"{MODAL} label.price-display__option:first-child input[type='checkbox']"
+        DOWN_PAYMENT_CB = f"{MODAL} label.price-display__option:last-child input[type='checkbox']"
 
-    up_final = page.locator(UNIT_PRICE_CB).is_checked()
-    dp_final = page.locator(DOWN_PAYMENT_CB).is_checked()
-    print(f"   ↳ Final state: Unit Price={up_final}  |  Down Payment={dp_final}")
-    confirm("STEP 4 — Price display correct?")
+        choice = decide_price(page)
+        print(f"   ↳ Choice made: {choice}")
+
+        up_checked = page.locator(UNIT_PRICE_CB).is_checked()
+        dp_checked = page.locator(DOWN_PAYMENT_CB).is_checked()
+        print(f"   ↳ Current state: Unit Price={up_checked}  |  Down Payment={dp_checked}")
+
+        if choice == "down_payment":
+            print(f"   ↳ Setting to: Down Payment")
+            if page.locator(UNIT_PRICE_CB).is_checked():
+                page.locator(UNIT_PRICE_CB).click()
+                page.wait_for_function(
+                    f"""() => {{
+                        const el = document.querySelector({UNIT_PRICE_CB!r});
+                        return el ? !el.checked : false;
+                    }}""",
+                    timeout=SLOW_TIMEOUT,
+                )
+            if not page.locator(DOWN_PAYMENT_CB).is_checked():
+                page.locator(DOWN_PAYMENT_CB).click()
+        else:
+            print(f"   ↳ Setting to: Unit Price")
+            if page.locator(DOWN_PAYMENT_CB).is_checked():
+                page.locator(DOWN_PAYMENT_CB).click()
+                page.wait_for_function(
+                    f"""() => {{
+                        const el = document.querySelector({DOWN_PAYMENT_CB!r});
+                        return el ? !el.checked : false;
+                    }}""",
+                    timeout=SLOW_TIMEOUT,
+                )
+            if not page.locator(UNIT_PRICE_CB).is_checked():
+                page.locator(UNIT_PRICE_CB).click()
+
+        up_final = page.locator(UNIT_PRICE_CB).is_checked()
+        dp_final = page.locator(DOWN_PAYMENT_CB).is_checked()
+        print(f"   ↳ Final state: Unit Price={up_final}  |  Down Payment={dp_final}")
+        confirm("STEP 4 — Price display correct?")
 
     # ── Switch to Images tab ───────────────────────────────────────
     print("   ── Switching to Images tab…")
@@ -1143,12 +1182,15 @@ def process_unit(page: Page, url: str, name: str, mapping: dict, states: dict):
 def process_current_page(page: Page, mapping: dict, page_num: int, results: list, states: dict):
     list_url = page.url
 
-    links = page.locator("a[href*='/resale-unit/'], a[href*='realestate-workspace/resale-unit/']").all()
+    # Rent and Re-Sale share the same flow; only the detail-link route differs.
+    slug = "rent-unit" if CURRENT_VIEW == "Rent" else "resale-unit"
+
+    links = page.locator(f"a[href*='/{slug}/'], a[href*='realestate-workspace/{slug}/']").all()
     hrefs = list(dict.fromkeys(
         a.get_attribute("href") for a in links if a.get_attribute("href")
     ))
 
-    hrefs = [h for h in hrefs if h and "realestate-workspace/resale-unit?" not in h and not h.endswith("/resale-unit")]
+    hrefs = [h for h in hrefs if h and f"realestate-workspace/{slug}?" not in h and not h.endswith(f"/{slug}")]
 
     if hrefs:
         print(f"\n  📄 Page {page_num}  —  {len(hrefs)} unit(s)")
@@ -1292,6 +1334,18 @@ def main():
         print("\n  → Navigate to the filtered unit list in Chrome")
         print("  → Set your filters and Available checkbox")
         input("  → Press Enter when ready… \n")
+
+        # Detect which tab is active BEFORE scanning. Rent reuses the whole flow
+        # but skips price/down-payment logic; anything else runs as Re-Sale.
+        global CURRENT_VIEW
+        CURRENT_VIEW = detect_active_view(page)
+        if CURRENT_VIEW == "Rent":
+            print("  Active view: Rent  —  price/down-payment logic will be skipped")
+        elif CURRENT_VIEW == "Re-Sale":
+            print("  Active view: Re-Sale")
+        else:
+            print(f"  ⚠ Active view: {CURRENT_VIEW} — expected Rent or Re-Sale. Proceeding as Re-Sale.")
+            CURRENT_VIEW = "Re-Sale"
 
         print("  Scanning page for projects and unit types…")
         project_types = scan_projects_types(page)
