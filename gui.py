@@ -418,6 +418,30 @@ class DebeedApp:
                   command=lambda: self._respond(""),
                   ).pack(side=tk.RIGHT)
 
+    def _panel_retry(self, prompt: str):
+        self._clear()
+        self._status_var.set("Wrong tab  —  switch to Rent or Re-Sale, then Retry")
+
+        f = tk.Frame(self._action, bg=BG_ACTION)
+        f.pack(fill=tk.X, padx=20, pady=14)
+
+        tk.Label(f,
+                 text="⚠  Wrong tab selected.\n"
+                      "Only  Rent  and  Re-Sale  are supported.\n"
+                      "Switch to one of those tabs in Chrome, then click Retry.",
+                 bg=BG_ACTION, fg=FG_WARNING,
+                 font=("Segoe UI", 10), justify=tk.LEFT,
+                 wraplength=700,
+                 ).pack(side=tk.LEFT, padx=(0, 20), anchor="w")
+
+        tk.Button(f, text="↻  Retry",
+                  bg=BTN_GOLD_BG, fg=BTN_GOLD_FG,
+                  font=("Segoe UI", 12, "bold"),
+                  relief=tk.FLAT, padx=28, pady=10,
+                  cursor="hand2",
+                  command=lambda: self._respond(""),
+                  ).pack(side=tk.RIGHT)
+
     def _panel_complete(self):
         self._clear()
         f = tk.Frame(self._action, bg=BG_ACTION)
@@ -614,7 +638,9 @@ class DebeedApp:
                     pass
 
             p = prompt.lower()
-            if "(y/n)" in p or "y/n" in p:
+            if "retry" in p:
+                kind = "retry"
+            elif "(y/n)" in p or "y/n" in p:
                 kind = "yes_no"
             elif "folder path" in p or "path for" in p or "new folder" in p:
                 kind = "folder"
@@ -715,6 +741,8 @@ class DebeedApp:
                 self._panel_yes_no(prompt)
             elif kind == "folder":
                 self._panel_folder(prompt)
+            elif kind == "retry":
+                self._panel_retry(prompt)
             else:
                 self._panel_continue(prompt)
         except queue.Empty:

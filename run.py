@@ -1336,16 +1336,20 @@ def main():
         input("  → Press Enter when ready… \n")
 
         # Detect which tab is active BEFORE scanning. Rent reuses the whole flow
-        # but skips price/down-payment logic; anything else runs as Re-Sale.
+        # but skips price/down-payment logic. Only Rent and Re-Sale are valid —
+        # Primary/unknown means the user is on the wrong tab, so block with a
+        # retry prompt until they switch to a supported tab.
         global CURRENT_VIEW
         CURRENT_VIEW = detect_active_view(page)
+        while CURRENT_VIEW not in ("Rent", "Re-Sale"):
+            print(f"  ⚠ Active view: {CURRENT_VIEW} — only Rent or Re-Sale are supported.")
+            input("  Switch to the Rent or Re-Sale tab in Chrome, then click Retry to re-check… ")
+            CURRENT_VIEW = detect_active_view(page)
+
         if CURRENT_VIEW == "Rent":
             print("  Active view: Rent  —  price/down-payment logic will be skipped")
-        elif CURRENT_VIEW == "Re-Sale":
-            print("  Active view: Re-Sale")
         else:
-            print(f"  ⚠ Active view: {CURRENT_VIEW} — expected Rent or Re-Sale. Proceeding as Re-Sale.")
-            CURRENT_VIEW = "Re-Sale"
+            print("  Active view: Re-Sale")
 
         print("  Scanning page for projects and unit types…")
         project_types = scan_projects_types(page)
