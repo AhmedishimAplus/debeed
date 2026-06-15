@@ -33,8 +33,10 @@ python gui.py
 ```
 
 1. Window opens — Chrome launches **automatically** (no `.bat` needed)
-2. Log in to the CRM → navigate to your filtered list → set filters + Available checkbox
-3. Click **▶ Start** in the GUI
+2. Keep the CRM as the **one and only tab** open — do not open extra tabs
+3. Log in to the CRM → navigate to your filtered list → set filters + Available checkbox
+4. Open either the **Rent** or **Re-Sale** workspace tab (these are the only two supported)
+5. Click **▶ Start** in the GUI
 
 ---
 
@@ -45,6 +47,18 @@ python run.py
 ```
 
 Chrome still launches automatically. Follow on-screen prompts.
+
+---
+
+## Workspace tabs (Rent / Re-Sale)
+
+Before scanning, the script detects which workspace tab is active:
+
+- **Re-Sale** → full flow (price display auto-selected: Down Payment vs Unit Price)
+- **Rent** → same flow, **but the price/down-payment logic is skipped** (rent units have no such decision); images are still selected exactly the same way
+- **Primary / unknown** → not supported. The script blocks and shows a **Retry** button (GUI) / retry prompt (terminal). Switch to the Rent or Re-Sale tab in Chrome, then click **Retry** to re-check.
+
+Tab detection is route-based (`/rent-unit` vs `/resale-unit`) so it survives label translation.
 
 ---
 
@@ -112,7 +126,7 @@ Examples:
    - **Green / faded** → already published, skip
    - **Disabled** → cannot publish (duplicate), skip
 3. Open Image Manager → upload images (order randomized) → tag as `Live Photo`
-4. Open Publish Unit modal → auto-select price display (Down Payment vs Unit Price) → select images → check Published → Save
+4. Open Publish Unit modal → auto-select price display (Down Payment vs Unit Price) **— skipped on Rent** → select images → check Published → Save
 5. Go back to list → next unit
 
 ---
