@@ -61,12 +61,22 @@ class UnitSkipped(Exception):
 # input and dismiss its panel. None in terminal mode. Signature: (default) -> None
 _cancel_gui_input = None
 
+# Sentinel returned by input_with_timeout when a caller wants to detect a timeout
+# rather than substitute a literal answer.
+_TIMED_OUT = "\x00__TIMED_OUT__\x00"
+
 
 def input_with_timeout(prompt: str, timeout: int = UPLOAD_PROMPT_TIMEOUT,
-                       default: str = "y") -> str:
+                       default: str = "y", announce=None,
+                       announce_every: int = 10, announce_tail: int = 5,
+                       final_msg: bool = True) -> str:
     """Ask the user, but auto-answer `default` if there is no response within
     `timeout` seconds. A live countdown is printed while waiting. Works in both
     terminal and GUI mode (GUI releases the pending prompt via _cancel_gui_input).
+
+    `announce(remaining_secs) -> str` customizes the countdown line; when given,
+    the generic final timeout line is suppressed (set `final_msg=False` so the
+    caller prints its own). `announce_every` / `announce_tail` control cadence.
     """
     box = {}
     answered = threading.Event()
@@ -88,18 +98,24 @@ def input_with_timeout(prompt: str, timeout: int = UPLOAD_PROMPT_TIMEOUT,
         if remaining <= 0:
             break
         secs = int(remaining + 0.999)
-        # Announce every 10s, plus every second in the final 5s.
-        if (secs % 10 == 0 or secs <= 5) and secs not in announced:
+        if (secs % announce_every == 0 or (announce_tail and secs <= announce_tail)) \
+                and secs not in announced:
             announced.add(secs)
-            m, s = divmod(secs, 60)
-            print(f"   ⏳ Auto-continuing in {m}:{s:02d} if no response…")
+            if announce is not None:
+                msg = announce(secs)
+                if msg:
+                    print(msg)
+            else:
+                m, s = divmod(secs, 60)
+                print(f"   ⏳ Auto-continuing in {m}:{s:02d} if no response…")
 
     if answered.is_set():
         return box.get("value", default)
 
-    m, s = divmod(timeout, 60)
-    print(f"   ⏱ No response after {m}:{s:02d} — continuing as if you answered "
-          f"'{default}'.")
+    if final_msg and announce is None:
+        m, s = divmod(timeout, 60)
+        print(f"   ⏱ No response after {m}:{s:02d} — continuing as if you answered "
+              f"'{default}'.")
     if callable(_cancel_gui_input):
         try:
             _cancel_gui_input(default)
@@ -129,6 +145,114 @@ def _dismiss_upload_modals(page):
             page.locator(MODAL).wait_for(state="hidden", timeout=SLOW_TIMEOUT)
     except Exception:
         pass
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  UNIT TYPE CATEGORIES  +  SMART IMAGE-PATH FALLBACK (page 2+)
+# ═══════════════════════════════════════════════════════════════════
+_SMALL_TYPES = [
+    "Apartment", "Branded Apartment", "Service Apartment", "Studio", "Penthouse",
+    "Duplex", "Triplex", "Quattro", "Loft", "Atelier", "Chalet", "Cabin",
+]
+_BIG_TYPES = [
+    "Standalone", "I Villa", "S Villa", "Duet Villa", "Twinhouse", "Townhouse",
+    "Townhouse Corner", "Townhouse Middle", "Building",
+]
+_OTHER_TYPES = [
+    "Land", "Bank", "Office", "Clinic", "Retail", "Commercial", "Showroom",
+    "Pharmacy", "Hospital", "School", "Factory", "Storage", "Basement",
+    "Food and Beverage",
+]
+
+
+def _norm_type(value: str) -> str:
+    return re.sub(r"[\s\-_]+", "", value or "").lower()
+
+
+_CATEGORY_BY_NORM = {}
+for _t in _SMALL_TYPES:
+    _CATEGORY_BY_NORM[_norm_type(_t)] = "Small"
+for _t in _BIG_TYPES:
+    _CATEGORY_BY_NORM[_norm_type(_t)] = "Big"
+for _t in _OTHER_TYPES:
+    _CATEGORY_BY_NORM[_norm_type(_t)] = "Other"
+
+
+def category_of(unit_type: str):
+    """Return 'Small' / 'Big' / 'Other', or None if the type is not categorized."""
+    return _CATEGORY_BY_NORM.get(_norm_type(unit_type))
+
+
+# Individual image file paths that uploaded successfully, keyed by (project, type).
+# Maintained for the whole run and borrowed by the page-2+ fallback. Reset in main().
+_successful_uploads = {}
+
+
+def _record_successful_uploads(project: str, unit_type: str, files: list):
+    """Remember the exact files that uploaded OK for a (project, type)."""
+    if files:
+        _successful_uploads[(project, unit_type)] = list(files)
+
+
+def choose_fallback_donor(project: str, new_type: str):
+    """Pick a random same-category sibling type (same project) that has recorded
+    successful image files. Returns (donor_type, [files]) or None.
+    Only Small/Big types are eligible — Other/uncategorized never borrow."""
+    cat = category_of(new_type)
+    if cat not in ("Small", "Big"):
+        return None
+    candidates = [
+        (t, files) for (proj, t), files in _successful_uploads.items()
+        if proj == project and files and t != new_type and category_of(t) == cat
+    ]
+    if not candidates:
+        return None
+    return random.choice(candidates)
+
+
+def collect_path_for_new_type(project: str, new_type: str) -> list:
+    """Ask the user for an image folder for a NEW per-type entry found on page 2+.
+    If a same-category sibling with successful uploads exists, a 2-minute timer
+    runs; on expiry it borrows that sibling's successful files. Otherwise it waits
+    indefinitely (old behavior)."""
+    donor = choose_fallback_donor(project, new_type)
+
+    if donor is None:
+        # Old behavior — wait indefinitely for a valid folder.
+        while True:
+            try:
+                files = validate_folder(clean_path(input(f"\n  Folder path for [{project} -> {new_type}]: ")))
+                print(f"  ✓ {len(files)} image(s) found")
+                return files
+            except FileNotFoundError as e:
+                print(f"  ✗ {e} — try again")
+
+    donor_type, donor_files = donor
+
+    def announce(secs):
+        m, s = divmod(secs, 60)
+        return f"   ⏳ No response for {new_type} — using {donor_type} images in {m}:{s:02d}"
+
+    raw = input_with_timeout(
+        f"\n  Folder path for [{project} -> {new_type}]  "
+        f"(auto-uses {donor_type} images in 2 min): ",
+        timeout=120, default=_TIMED_OUT,
+        announce=announce, announce_every=30, announce_tail=0, final_msg=False,
+    )
+
+    if raw == _TIMED_OUT:
+        print(f"   ⏳ No response received — using {donor_type} images for {new_type}")
+        return list(donor_files)
+
+    # User engaged — validate, retry indefinitely on a bad path.
+    while True:
+        try:
+            files = validate_folder(clean_path(raw))
+            print(f"  ✓ {len(files)} image(s) found")
+            return files
+        except FileNotFoundError as e:
+            print(f"  ✗ {e} — try again")
+            raw = input(f"\n  Folder path for [{project} -> {new_type}]: ")
 
 
 class Tee:
@@ -553,7 +677,8 @@ def confirm_mapping(mapping: dict) -> bool:
             print(f"  {'':20}    {folder}")
     print(f"{'═'*50}")
     while True:
-        ans = input("\n  Look good? Start? (y/n): ").strip().lower()
+        ans = input_with_timeout("\n  Look good? Start? (y/n): ",
+                                 timeout=UPLOAD_PROMPT_TIMEOUT, default="y").strip().lower()
         if ans == "y": return True
         if ans == "n": return False
         print("  Enter y or n.")
@@ -601,14 +726,8 @@ def update_image_mapping(existing_mapping: dict, new_types: list) -> dict:
     if isinstance(first_val, dict):
         for proj, t in new_types_needed:
             pdata = existing_mapping.setdefault(proj, {"_same_for_all": False})
-            while True:
-                try:
-                    files = validate_folder(clean_path(input(f"\n  Folder path for [{proj} -> {t}]: ")))
-                    print(f"  ✓ {len(files)} image(s) found")
-                    pdata[t] = files
-                    break
-                except FileNotFoundError as e:
-                    print(f"  ✗ {e} — try again")
+            # Per-type project on page 2+: allow a same-category timed fallback.
+            pdata[t] = collect_path_for_new_type(proj, t)
     else:
         for t in new_types_needed:
             while True:
@@ -641,7 +760,8 @@ def update_image_mapping(existing_mapping: dict, new_types: list) -> dict:
     print(f"{'═'*50}")
     
     while True:
-        ans = input("\n  All good? Continue? (y/n): ").strip().lower()
+        ans = input_with_timeout("\n  All good? Continue? (y/n): ",
+                                 timeout=UPLOAD_PROMPT_TIMEOUT, default="y").strip().lower()
         if ans == "y": return existing_mapping
         if ans == "n":
             print("\n  Cancelled.")
@@ -938,6 +1058,7 @@ def step_upload_images(page: Page, paths: list, project: str, unit_type: str, st
                         pdata[unit_type] = successful_paths
                     mapping[project] = pdata
                     actual_count = len(successful_paths)
+                    _record_successful_uploads(project, unit_type, successful_paths)
                     print(f"   ✓ Pool updated to {actual_count} image(s), won't ask again for '{unit_type}'")
                     # Close upload modal and continue normally
                     if page.locator(UPLOAD).is_visible():
@@ -1000,6 +1121,7 @@ def step_upload_images(page: Page, paths: list, project: str, unit_type: str, st
                     pdata[unit_type] = successful_paths
                 mapping[project] = pdata
                 actual_count = len(successful_paths)
+                _record_successful_uploads(project, unit_type, successful_paths)
                 print(f"   ℹ Already acknowledged for '{unit_type}' — omitting {n_failed} failed image(s), using {actual_count}")
                 if page.locator(UPLOAD).is_visible():
                     try:
@@ -1013,6 +1135,7 @@ def step_upload_images(page: Page, paths: list, project: str, unit_type: str, st
                     print("   ℹ Upload modal already closed")
         else:
             print("   ✓ All images uploaded successfully")
+            _record_successful_uploads(project, unit_type, list(paths))
             if page.locator(UPLOAD).is_visible():
                 try:
                     page.locator(f"{UPLOAD} .btn-modal-close").click()
@@ -1431,6 +1554,7 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
 # ═══════════════════════════════════════════════════════════════════
 def main():
     setup_run_logging()
+    _successful_uploads.clear()
     print("\n" + "═"*50)
     print("  EGY Property Automation")
     print("═"*50)
