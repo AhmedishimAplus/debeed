@@ -81,6 +81,11 @@ class DebeedApp:
         self._pending_folder_valid = False
         self._log_cleaned          = False
 
+        # Guards a single pending input so a button click and a prompt timeout
+        # can never both answer the same prompt (would desync the response queue).
+        self._input_lock           = threading.Lock()
+        self._awaiting             = False
+
         self._build_ui()
         self._patch_io()
         self._poll()
@@ -561,9 +566,24 @@ class DebeedApp:
     # ═══════════════════════════════════════════════════════════════
 
     def _respond(self, value: str):
+        with self._input_lock:
+            if not self._awaiting:
+                return
+            self._awaiting = False
         self._response_q.put(value)
         self._wait_evt.set()
         self._panel_running()
+
+    def _timeout_input(self, default: str):
+        # Called from the automation thread when a timed prompt expires.
+        # Releases the blocked gui_input with `default` and dismisses the panel.
+        with self._input_lock:
+            if not self._awaiting:
+                return
+            self._awaiting = False
+        self._response_q.put(default)
+        self._wait_evt.set()
+        self._log_q.put(("dismiss", None))
 
     def _ensure_chrome_path(self):
         try:
@@ -645,8 +665,10 @@ class DebeedApp:
             else:
                 kind = "enter"
 
-            app._input_q.put((kind, prompt))
             app._wait_evt.clear()
+            with app._input_lock:
+                app._awaiting = True
+            app._input_q.put((kind, prompt))
             app._wait_evt.wait()
 
             response = app._response_q.get()
@@ -661,6 +683,9 @@ class DebeedApp:
             return response
 
         builtins.input = gui_input
+
+        # Let run.py's timed prompts release this blocked input on timeout.
+        _run._cancel_gui_input = self._timeout_input
 
     # ═══════════════════════════════════════════════════════════════
     #  LOG RENDERING
@@ -728,6 +753,8 @@ class DebeedApp:
                 kind, payload = self._log_q.get_nowait()
                 if kind == "log":
                     self._append_log(payload)
+                elif kind == "dismiss":
+                    self._panel_running()
                 elif kind == "done":
                     self._panel_complete()
         except queue.Empty:

@@ -20,7 +20,7 @@ SETUP (one-time):
 
 from _exe_setup import setup, launch_chrome
 setup()
-import re, csv, random, sys, builtins
+import re, csv, random, sys, builtins, threading, time
 from datetime import datetime
 from pathlib import Path
 from playwright.sync_api import sync_playwright, Page
@@ -39,6 +39,96 @@ SLOW_TIMEOUT   = 300_000    # 5 minutes - used for unpredictable slow CRM respon
 # Re-Sale is the default and original behaviour. Rent reuses the entire flow but
 # skips the price/down-payment logic in step_publish (no price decision needed).
 CURRENT_VIEW   = "Re-Sale"
+
+# Failure thresholds for image upload (see step_upload_images):
+#   ≤ 25% failed  → ask user, auto-continue after timeout
+#   > 25% failed  → skip whole unit, log failed paths
+#   100% failed   → skip whole unit (no paths needed)
+UPLOAD_FAIL_SKIP_PCT  = 25.0
+UPLOAD_PROMPT_TIMEOUT = 120   # seconds to wait for user before auto-continuing
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  SKIP SIGNAL + TIMED INPUT
+# ═══════════════════════════════════════════════════════════════════
+class UnitSkipped(Exception):
+    """Raised inside processing to abort the current unit, log it as failed,
+    and move straight to the next unit without a manual 'fix it' prompt."""
+    pass
+
+
+# Hook installed by gui.py so a timed-out prompt can release the blocked GUI
+# input and dismiss its panel. None in terminal mode. Signature: (default) -> None
+_cancel_gui_input = None
+
+
+def input_with_timeout(prompt: str, timeout: int = UPLOAD_PROMPT_TIMEOUT,
+                       default: str = "y") -> str:
+    """Ask the user, but auto-answer `default` if there is no response within
+    `timeout` seconds. A live countdown is printed while waiting. Works in both
+    terminal and GUI mode (GUI releases the pending prompt via _cancel_gui_input).
+    """
+    box = {}
+    answered = threading.Event()
+
+    def worker():
+        try:
+            box["value"] = input(prompt)
+        except Exception:
+            box["value"] = default
+        finally:
+            answered.set()
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    end = time.time() + timeout
+    announced = set()
+    while not answered.wait(0.25):
+        remaining = end - time.time()
+        if remaining <= 0:
+            break
+        secs = int(remaining + 0.999)
+        # Announce every 10s, plus every second in the final 5s.
+        if (secs % 10 == 0 or secs <= 5) and secs not in announced:
+            announced.add(secs)
+            m, s = divmod(secs, 60)
+            print(f"   ⏳ Auto-continuing in {m}:{s:02d} if no response…")
+
+    if answered.is_set():
+        return box.get("value", default)
+
+    m, s = divmod(timeout, 60)
+    print(f"   ⏱ No response after {m}:{s:02d} — continuing as if you answered "
+          f"'{default}'.")
+    if callable(_cancel_gui_input):
+        try:
+            _cancel_gui_input(default)
+        except Exception:
+            pass
+    answered.wait(2)   # let the worker drain the injected response, if any
+    return default
+
+
+def _dismiss_upload_modals(page):
+    """Best-effort close of the Upload sub-modal and Image Manager modal so the
+    page is left clean before a unit is skipped."""
+    UPLOAD = ".modal.fade.show"
+    MODAL  = ".modal-mask"
+    try:
+        if page.locator(UPLOAD).is_visible():
+            page.locator(f"{UPLOAD} .btn-modal-close").click(timeout=SLOW_TIMEOUT)
+            page.locator(UPLOAD).wait_for(state="hidden", timeout=SLOW_TIMEOUT)
+    except Exception:
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+    try:
+        if page.locator(MODAL).is_visible():
+            page.locator(f"{MODAL} button", has_text="Cancel").first.click(timeout=SLOW_TIMEOUT)
+            page.locator(MODAL).wait_for(state="hidden", timeout=SLOW_TIMEOUT)
+    except Exception:
+        pass
 
 
 class Tee:
@@ -812,12 +902,31 @@ def step_upload_images(page: Page, paths: list, project: str, unit_type: str, st
             n_success = len(paths) - n_failed
             failed_paths = [p for p in paths if Path(p).name in failed_filenames]
 
-            print(f"\n   ⚠ {n_failed} image(s) failed to upload:")
+            fail_pct = n_failed / len(paths) * 100 if paths else 100.0
+            print(f"\n   ⚠ {n_failed}/{len(paths)} image(s) failed to upload ({fail_pct:.0f}%):")
             for fp in failed_paths:
                 print(f"      → {fp}")
 
+            # ── 100% failed → no images uploaded, skip the whole unit ──
+            if n_success == 0:
+                print("   ⏭ All images failed — skipping this unit.")
+                _dismiss_upload_modals(page)
+                raise UnitSkipped(f"all {n_failed} image(s) failed to upload")
+
+            # ── >25% failed → too many bad images, skip unit and log paths ──
+            if fail_pct > UPLOAD_FAIL_SKIP_PCT:
+                print(f"   ⏭ {fail_pct:.0f}% failed (> {UPLOAD_FAIL_SKIP_PCT:.0f}%) — skipping this unit.")
+                _dismiss_upload_modals(page)
+                raise UnitSkipped(
+                    f"{n_failed} image(s) failed to upload: " + "; ".join(failed_paths)
+                )
+
+            # ── ≤25% failed → ask, but auto-continue (as 'y') after timeout ──
             if state.should_ask_user(unit_type):
-                ans = input(f"\n   ❓ Continue with {n_success} image(s) instead of {len(paths)}? (y/n): ").strip().lower()
+                ans = input_with_timeout(
+                    f"\n   ❓ Continue with {n_success} image(s) instead of {len(paths)}? (y/n): ",
+                    timeout=UPLOAD_PROMPT_TIMEOUT, default="y",
+                ).strip().lower()
 
                 if ans == "y":
                     state.mark_acknowledged(unit_type)
@@ -1214,6 +1323,13 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
                 process_unit(page, url, name, mapping, states)
                 results.append({"page": page_num, "unit": name, "url": url, "status": "OK"})
                 print("  ✅ Done")
+            except UnitSkipped as e:
+                print(f"  ⏭ Skipped: {e}")
+                results.append({"page": page_num, "unit": name, "url": url, "status": f"FAILED: {e}"})
+                try:
+                    go_back_to_list(page)
+                except Exception as ge:
+                    print(f"   ⚠ Could not return to list cleanly: {ge}")
             except Exception as e:
                 print(f"  ✗ ERROR: {e}")
                 results.append({"page": page_num, "unit": name, "url": url, "status": f"FAILED: {e}"})
@@ -1298,6 +1414,13 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
             process_unit(page, None, name, mapping, states)
             results.append({"page": page_num, "unit": name, "url": page.url, "status": "OK"})
             print("  ✅ Done")
+        except UnitSkipped as e:
+            print(f"  ⏭ Skipped: {e}")
+            results.append({"page": page_num, "unit": name, "url": page.url, "status": f"FAILED: {e}"})
+            try:
+                go_back_to_list(page)
+            except Exception as ge:
+                print(f"   ⚠ Could not return to list cleanly: {ge}")
         except Exception as e:
             print(f"  ✗ ERROR: {e}")
             results.append({"page": page_num, "unit": name, "url": page.url, "status": f"FAILED: {e}"})
