@@ -20,12 +20,44 @@ from datetime import datetime
 # ── Module-level log state ─────────────────────────────────────────
 _log_file = None
 _log_path = None
+_persist_log = False      # True once the user opts to keep all runs in one file
+_run_number  = 0          # incremented each run; shown as "run #N" in the log
+_at_line_start = True     # line-state for timestamping the log file
+
+
+def _file_write(text: str):
+    """Append `text` to the run log file, prefixing each line with [HH:MM:SS] so
+    the saved file matches the on-screen activity log."""
+    global _at_line_start
+    if not _log_file or not text:
+        return
+    out = []
+    for piece in text.splitlines(keepends=True):
+        if _at_line_start and piece.rstrip("\r\n").strip():
+            out.append(f"[{datetime.now():%H:%M:%S}]  ")
+        out.append(piece)
+        _at_line_start = piece.endswith("\n")
+    try:
+        _log_file.write("".join(out))
+        _log_file.flush()
+    except Exception:
+        pass
+
 
 def _gui_setup_logging():
-    global _log_file, _log_path
+    global _log_file, _log_path, _run_number, _at_line_start
     Path("logs").mkdir(exist_ok=True)
-    _log_path = Path("logs") / f"run_{datetime.now():%Y%m%d_%H%M%S}.txt"
-    _log_file = open(_log_path, "a", encoding="utf-8", buffering=1)
+    if _persist_log and _log_file:
+        # Keep appending to the same file — just start a new run section.
+        _run_number += 1
+    else:
+        _run_number = 1
+        _log_path = Path("logs") / f"run_{datetime.now():%Y%m%d_%H%M%S}.txt"
+        _log_file = open(_log_path, "a", encoding="utf-8", buffering=1)
+    _at_line_start = True
+    print(f"\n{'═'*50}")
+    print(f"  run #{_run_number}")
+    print(f"{'═'*50}")
     print(f"  Logging to: {_log_path}")
 
 import run as _run
@@ -85,6 +117,9 @@ class DebeedApp:
         # can never both answer the same prompt (would desync the response queue).
         self._input_lock           = threading.Lock()
         self._awaiting             = False
+
+        # Scheduled "save log?" popup id, so Restart can cancel it.
+        self._keep_log_after       = None
 
         self._build_ui()
         self._patch_io()
@@ -450,10 +485,20 @@ class DebeedApp:
         f = tk.Frame(self._action, bg=BG_ACTION)
         f.pack(fill=tk.X, padx=20, pady=14)
         tk.Label(f,
-                 text="✅  All units processed.  Use the buttons below to save results and log.",
+                 text="✅  All units processed.  Save results/log below, or Restart for a new run.",
                  bg=BG_ACTION, fg=FG_SUCCESS,
                  font=("Segoe UI", 11, "bold"),
                  ).pack(side=tk.LEFT)
+
+        # Restart — begin a fresh operation as if the app was relaunched.
+        tk.Button(f, text="🔄  Restart",
+                  bg=BTN_GOLD_BG, fg=BTN_GOLD_FG,
+                  font=("Segoe UI", 11, "bold"),
+                  relief=tk.FLAT, padx=22, pady=9,
+                  cursor="hand2",
+                  command=self._restart,
+                  ).pack(side=tk.RIGHT)
+
         self._status_var.set("Complete")
         self._prog["value"] = 100
 
@@ -461,7 +506,7 @@ class DebeedApp:
         self._btn_results.pack(side=tk.LEFT, padx=(8, 0))
 
         # Ask about log after UI renders
-        self.root.after(1500, self._ask_keep_log)
+        self._keep_log_after = self.root.after(1500, self._ask_keep_log)
 
     # ═══════════════════════════════════════════════════════════════
     #  FILE SAVE & CLEANUP
@@ -523,6 +568,7 @@ class DebeedApp:
             messagebox.showerror("Save Failed", f"Could not save results:\n{e}", parent=self.root)
 
     def _ask_keep_log(self):
+        self._keep_log_after = None
         keep = messagebox.askyesno(
             "Save Activity Log?",
             "Automation complete.\n\n"
@@ -532,7 +578,8 @@ class DebeedApp:
         )
         if keep:
             self._save_log()
-        self._cleanup_log()
+        # Keep the log file open — a Restart may append to it (persistent mode)
+        # or replace it. It is removed on Quit (or on a fresh-log restart).
         self._log_cleaned = True
 
     def _cleanup_log(self):
@@ -560,6 +607,79 @@ class DebeedApp:
                 return
         self._cleanup_log()
         self.root.destroy()
+
+    def _restart(self):
+        """Begin a brand-new operation in the same process — equivalent to
+        quitting and relaunching. Re-initialises all in-memory run data; never
+        touches the user's image folders or any file they already saved."""
+        # 1. Confirm — finished results are about to be cleared from memory.
+        if not messagebox.askyesno(
+            "Start New Operation?",
+            "Start a brand-new operation?\n\n"
+            "The current run's results will be cleared from the program.\n"
+            "Already-saved log/CSV files and your image folders are NOT affected.",
+            parent=self.root,
+        ):
+            return
+
+        # 2. Decide log handling. Ask once; after the user opts into a shared
+        #    file we never ask again (persistent mode appends run #2, #3, …).
+        global _persist_log
+        if not _persist_log:
+            _persist_log = messagebox.askyesno(
+                "Log File",
+                "Keep ALL future runs in the SAME log file?\n\n"
+                "Yes — append each new run to this file (labelled run #1, run #2, …) "
+                "and don't ask again.\n\n"
+                "No — clear the screen, delete this log, and start a fresh log file.",
+                parent=self.root,
+            )
+
+        # 3. Cancel the pending "save log?" popup so it can't clean up mid-restart.
+        if self._keep_log_after is not None:
+            try:
+                self.root.after_cancel(self._keep_log_after)
+            except Exception:
+                pass
+            self._keep_log_after = None
+
+        # 4. Re-initialise run state (memory only — no image files touched).
+        _run._pending_results = None
+        try:
+            _run._successful_uploads.clear()
+        except Exception:
+            pass
+
+        # Drain any stale prompt/response so the new run starts clean.
+        for q in (self._input_q, self._response_q):
+            try:
+                while True:
+                    q.get_nowait()
+            except queue.Empty:
+                pass
+        with self._input_lock:
+            self._awaiting = False
+
+        # 5. Log file + on-screen history.
+        if _persist_log:
+            pass  # keep the same file and screen; setup adds a "run #N" header
+        else:
+            self._cleanup_log()          # close + delete the old log file
+            self._log.config(state=tk.NORMAL)
+            self._log.delete("1.0", tk.END)
+            self._log.config(state=tk.DISABLED)
+
+        # 6. Reset widgets/flags.
+        self._prog["value"] = 0
+        self._unit_counter.set("")
+        self._status_var.set("Starting new operation…")
+        self._btn_results.pack_forget()
+        self._btn_results.config(state=tk.NORMAL, text="📊  Save Results")
+        self._log_cleaned = False
+        self._started = False
+
+        # 7. Launch the fresh run (re-runs run.main from scratch).
+        self._start()
 
     # ═══════════════════════════════════════════════════════════════
     #  RESPONSE & AUTOMATION THREAD
@@ -631,12 +751,7 @@ class DebeedApp:
             def write(self, text):
                 if text:
                     app._log_q.put(("log", text))
-                    if _log_file:
-                        try:
-                            _log_file.write(text)
-                            _log_file.flush()
-                        except Exception:
-                            pass
+                    _file_write(text)
 
             def flush(self):
                 pass
@@ -648,12 +763,8 @@ class DebeedApp:
         sys.stderr = GUIStream()
 
         def gui_input(prompt: str = "") -> str:
-            if _log_file and prompt:
-                try:
-                    _log_file.write(f"PROMPT: {prompt.rstrip()}\n")
-                    _log_file.flush()
-                except Exception:
-                    pass
+            if prompt:
+                _file_write(f"PROMPT: {prompt.rstrip()}\n")
 
             p = prompt.lower()
             if "retry" in p:
@@ -673,12 +784,7 @@ class DebeedApp:
 
             response = app._response_q.get()
 
-            if _log_file:
-                try:
-                    _log_file.write(f"RESPONSE: {response}\n")
-                    _log_file.flush()
-                except Exception:
-                    pass
+            _file_write(f"RESPONSE: {response}\n")
 
             return response
 
