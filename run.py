@@ -187,6 +187,58 @@ def category_of(unit_type: str):
 # Maintained for the whole run and borrowed by the page-2+ fallback. Reset in main().
 _successful_uploads = {}
 
+# Filtered-list URL captured after the user presses Continue. Used by the
+# auto-refresh error recovery to reload the list with all the user's filters.
+_filtered_list_url = None
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  AUTO ERROR RECOVERY  (refresh-and-retry, no manual prompts)
+# ═══════════════════════════════════════════════════════════════════
+class NeedsRefresh(Exception):
+    """Raised when a unit error should trigger a list refresh + retry."""
+    pass
+
+
+# Per-run recovery state (reset in main()):
+_unit_fail_counts = {}    # unit name -> times it has errored (2nd time = skip)
+_skip_units       = set() # unit names to skip for good (persistent errors)
+_uploaded_units   = {}    # unit name -> image count already uploaded OK server-side
+
+
+def _normalize_list_url(url: str):
+    """Force non_published_units=1 and page_length=100 in the list URL, leaving
+    everything else untouched. Returns (new_url, changed)."""
+    if not url:
+        return url, False
+    # non_published_units: handles URL-encoded (%22) and literal (") JSON quoting.
+    new = re.sub(r'(non_published_units(?:%22|")\s*:\s*)\d+', r'\g<1>1', url)
+    new = re.sub(r'(page_length=)\d+', r'\g<1>100', new)
+    return new, (new != url)
+
+
+def _refresh_url() -> str:
+    """The saved list URL, normalized (non_published_units=1, page_length=100)."""
+    return _normalize_list_url(_filtered_list_url or "")[0]
+
+
+def friendly_error(exc) -> str:
+    """Turn a raw exception into a short, user-readable reason."""
+    s = str(exc).lower()
+    if "image manager" in s:
+        return "Couldn't open Image Manager in time (slow loading)."
+    if "publish unit" in s or "price display" in s:
+        return "Couldn't open the Publish window in time (slow loading)."
+    if "file chooser" in s or "file-preview" in s or "btn-file-upload" in s or "upload" in s:
+        return "Image upload didn't respond in time (slow loading)."
+    if "back" in s:
+        return "Couldn't return to the list in time (slow loading)."
+    if "image-wrapper" in s or "card" in s:
+        return "A unit element didn't load in time."
+    if "timeout" in s or "exceeded" in s:
+        return "The page took too long to respond."
+    return "Something didn't load in time."
+
 
 def _record_successful_uploads(project: str, unit_type: str, files: list):
     """Remember the exact files that uploaded OK for a (project, type)."""
@@ -1394,11 +1446,19 @@ def process_unit(page: Page, url: str, name: str, mapping: dict, states: dict):
     publish_status = check_publish_status(page)
 
     if publish_status == "red":
-        # Not published — proceed normally with upload and publish
-        print("   ↳ Status: Not published (RED) — proceeding normally with upload & publish")
         state = states.get(project) if isinstance(states, dict) else states
-        actual_count = step_upload_images(page, images, project, utype, state, mapping)
-        step_publish(page, n_images=actual_count)
+        if name in _uploaded_units:
+            # Scenario 1: images were already uploaded OK before a previous error
+            # (they persist server-side). Skip upload, go straight to publish.
+            print(f"   ↳ Images already uploaded earlier — skipping upload, publishing {_uploaded_units[name]} image(s)")
+            step_publish(page, n_images=_uploaded_units[name])
+        else:
+            # Not published — upload then publish. Record the uploaded count so a
+            # later error (e.g. during publish) can resume at publish, not re-upload.
+            print("   ↳ Status: Not published (RED) — proceeding normally with upload & publish")
+            actual_count = step_upload_images(page, images, project, utype, state, mapping)
+            _uploaded_units[name] = actual_count
+            step_publish(page, n_images=actual_count)
     elif publish_status == "disabled":
         # Button is disabled (e.g., duplicate unit) — skip to next unit
         print(f"   ↳ Status: Cannot publish (DISABLED) — skipping to next unit")
@@ -1409,9 +1469,102 @@ def process_unit(page: Page, url: str, name: str, mapping: dict, states: dict):
         go_back_to_list(page)
 
 # ═══════════════════════════════════════════════════════════════════
+#  AUTO-RECOVERY HELPERS  (refresh list, rescan, decide skip-vs-retry)
+# ═══════════════════════════════════════════════════════════════════
+def recover_via_refresh(page: Page):
+    """Reload the saved filtered list (forcing non_published_units=1), then wait
+    out the loading overlay indefinitely. The caller rescans and reprocesses.
+    No manual prompt — fully automatic."""
+    url = _refresh_url()
+    print("   🔄 Refreshing the unit list using your saved filters…")
+    try:
+        if url:
+            page.goto(url, timeout=SLOW_TIMEOUT)
+        else:
+            print("   ⚠ No saved list URL — reloading current page")
+            page.reload(timeout=SLOW_TIMEOUT)
+    except Exception as e:
+        print(f"   ⚠ Reload hiccup: {e} — continuing")
+    try:
+        page.wait_for_load_state("networkidle", timeout=SLOW_TIMEOUT)
+    except Exception:
+        pass
+
+    # The CRM shows a freeze/loading overlay after reload. Wait for it to clear,
+    # indefinitely (retry the wait until it disappears).
+    print("   ⏳ Waiting for the loading overlay to clear…")
+    while True:
+        try:
+            page.wait_for_selector(".freeze-message-container", state="hidden", timeout=SLOW_TIMEOUT)
+            break
+        except Exception:
+            continue
+    try:
+        page.wait_for_selector("div.card.cursor-pointer.rounded-0", state="visible", timeout=SLOW_TIMEOUT)
+    except Exception:
+        pass
+    print("   ✓ List reloaded")
+
+
+def ensure_mapping_for_page(page: Page, mapping: dict, states: dict):
+    """Scan the current list page and extend mapping/states for any new project
+    or per-type entry (same logic main() uses on pagination). Used after a
+    refresh so re-pulled cards always have image folders."""
+    current_projects = scan_projects_types(page)
+    if not current_projects:
+        return
+    for proj, types in current_projects.items():
+        if proj not in mapping:
+            print(f"\n  New project found: {proj} — requesting image folders")
+            new_map = collect_image_mapping_per_project({proj: types})
+            mapping.update(new_map)
+            states[proj] = UploadErrorState(same_images_mode=mapping[proj].get('_same_for_all', False))
+        else:
+            if mapping[proj].get('_same_for_all'):
+                continue
+            new_types = [t for t in types if t not in mapping[proj]]
+            if new_types:
+                update_image_mapping(mapping, [(proj, t) for t in new_types])
+    print(f"   ↳ Rescanned projects: {', '.join(current_projects.keys())}")
+
+
+def _handle_unit_error(name: str, exc: Exception, results: list, page_num: int, url: str):
+    """No-prompt error policy for a unit. First failure → refresh & retry
+    (raises NeedsRefresh). Second failure on the same unit → skip it for good
+    (persistent error, e.g. 'no access to modify this unit')."""
+    msg = friendly_error(exc)
+    _unit_fail_counts[name] = _unit_fail_counts.get(name, 0) + 1
+    print(f"  ⚠ {msg}")
+    print(f"     (details: {exc})")
+    if _unit_fail_counts[name] >= 2:
+        print(f"  ⏭ '{name}' failed again after a refresh — skipping this unit.")
+        _skip_units.add(name)
+        results.append({"page": page_num, "unit": name, "url": url,
+                        "status": f"FAILED: {msg}"})
+        return
+    raise NeedsRefresh()
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  PROCESS CURRENT PAGE  (only what's loaded right now)
 # ═══════════════════════════════════════════════════════════════════
 def process_current_page(page: Page, mapping: dict, page_num: int, results: list, states: dict):
+    """Process the current page, auto-recovering from errors by refreshing the
+    saved list and reprocessing. Persistently-failing units are skipped."""
+    while True:
+        try:
+            _process_page_once(page, mapping, page_num, results, states)
+            return
+        except NeedsRefresh:
+            recover_via_refresh(page)
+            try:
+                ensure_mapping_for_page(page, mapping, states)
+            except Exception as e:
+                print(f"   ⚠ Rescan after refresh failed: {e} — retrying page anyway")
+            # loop → reprocess the freshly reloaded page
+
+
+def _process_page_once(page: Page, mapping: dict, page_num: int, results: list, states: dict):
     list_url = page.url
 
     # Rent and Re-Sale share the same flow; only the detail-link route differs.
@@ -1442,6 +1595,9 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
 
         for i, (name, url) in enumerate(unit_data, 1):
             print(f"\n  [{i}/{len(unit_data)}]  {name}")
+            if name in _skip_units:
+                print("  ⏭ Skipping previously-failed unit")
+                continue
             try:
                 process_unit(page, url, name, mapping, states)
                 results.append({"page": page_num, "unit": name, "url": url, "status": "OK"})
@@ -1454,9 +1610,8 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
                 except Exception as ge:
                     print(f"   ⚠ Could not return to list cleanly: {ge}")
             except Exception as e:
-                print(f"  ✗ ERROR: {e}")
-                results.append({"page": page_num, "unit": name, "url": url, "status": f"FAILED: {e}"})
-                input("  ⚠ Fix manually if needed, then press Enter to continue… ")
+                # No manual prompt — refresh & retry, or skip if persistent.
+                _handle_unit_error(name, e, results, page_num, url)
 
         return
 
@@ -1488,6 +1643,9 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
             name = f"Unit {i + 1}"
 
         print(f"\n  [{i + 1}/{total_cards}]  {name}")
+        if name in _skip_units:
+            print("  ⏭ Skipping previously-failed unit")
+            continue
         try:
             # PRE-CLICK DIAGNOSTICS
             print(f"   [DEBUG] Total cards available: {cards.count()}")
@@ -1545,9 +1703,8 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
             except Exception as ge:
                 print(f"   ⚠ Could not return to list cleanly: {ge}")
         except Exception as e:
-            print(f"  ✗ ERROR: {e}")
-            results.append({"page": page_num, "unit": name, "url": page.url, "status": f"FAILED: {e}"})
-            input("  ⚠ Fix manually if needed, then press Enter to continue… ")
+            # No manual prompt — refresh & retry, or skip if persistent.
+            _handle_unit_error(name, e, results, page_num, page.url)
 
 # ═══════════════════════════════════════════════════════════════════
 #  MAIN
@@ -1555,6 +1712,9 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
 def main():
     setup_run_logging()
     _successful_uploads.clear()
+    _unit_fail_counts.clear()
+    _skip_units.clear()
+    _uploaded_units.clear()
     print("\n" + "═"*50)
     print("  EGY Property Automation")
     print("═"*50)
@@ -1602,10 +1762,19 @@ def main():
 
         ctx  = browser.contexts[0]
         page = ctx.pages[0]
-        print(f"\n✅  Connected  |  {page.url}")
         print("\n  → Navigate to the filtered unit list in Chrome")
         print("  → Set your filters and Available checkbox")
         input("  → Press Enter when ready… \n")
+
+        # User done navigating — capture the filtered-list URL, fixing it to
+        # non_published_units=1 and page_length=100 (used for error recovery too).
+        global _filtered_list_url
+        normalized, changed = _normalize_list_url(page.url)
+        _filtered_list_url = normalized
+        print(f"\n✅  Connected  |  {_filtered_list_url}")
+        if changed:
+            print("   ⚙ List view not set to (non-published units, 100 per page) — adjusting…")
+            recover_via_refresh(page)
 
         # Detect which tab is active BEFORE scanning. Rent reuses the whole flow
         # but skips price/down-payment logic. Only Rent and Re-Sale are valid —
