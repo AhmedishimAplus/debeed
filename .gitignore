@@ -4,6 +4,7 @@
 /results.csv
 /logs
 /HANDOFF.md
+/CONVERSATION_SUMMARY.md
 /.claude
 build/
 dist/
