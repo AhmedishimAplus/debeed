@@ -282,9 +282,7 @@ class DebeedApp:
             "1.  Please make sure the CRM tab is the one and only tab open — do not open additional tabs.\n"
             "2.  Log in to the CRM and navigate to your filtered unit list.\n"
             "3.  Apply filters, tick  Available,  then click  Start  below.\n"
-            "4.  While it runs, do not click the new Chrome tab. If something goes wrong and\n"
-            "     you need to refresh, press  Refresh Page  to reload from the saved list.\n"
-            "     Read  PLEASE NOTE  (shown after Start) before pressing  Continue."
+            "4.  While it runs, don't touch the Chrome tab — if something breaks, press  Refresh Page  to reload."
         )
         tk.Label(f,
                  text=instructions,
@@ -360,6 +358,34 @@ class DebeedApp:
                   cursor="hand2",
                   command=lambda: self._respond("y"),
                   ).pack(side=tk.RIGHT, padx=(8, 0))
+
+    def _panel_select(self, prompt: str):
+        # prompt = "<question>\n::SELECT::opt1||opt2||opt3"
+        self._clear()
+        question, _, raw = prompt.partition("::SELECT::")
+        options = [o for o in raw.split("||") if o.strip()]
+        question = question.strip().rstrip(":").strip()
+
+        f = tk.Frame(self._action, bg=BG_ACTION)
+        f.pack(fill=tk.X, padx=20, pady=14)
+
+        tk.Label(f, text=question,
+                 bg=BG_ACTION, fg=FG_TEXT,
+                 font=("Segoe UI", 11),
+                 wraplength=700, justify=tk.LEFT,
+                 ).pack(anchor="w", pady=(0, 12))
+
+        btns = tk.Frame(f, bg=BG_ACTION)
+        btns.pack(anchor="w")
+
+        for opt in options:
+            tk.Button(btns, text=opt,
+                      bg=BTN_BLUE_BG, fg=BTN_BLUE_FG,
+                      font=("Segoe UI", 10, "bold"),
+                      relief=tk.FLAT, padx=16, pady=8,
+                      cursor="hand2",
+                      command=lambda o=opt: self._respond(o),
+                      ).pack(side=tk.LEFT, padx=(0, 8), pady=4)
 
     def _panel_folder(self, prompt: str):
         self._clear()
@@ -802,7 +828,9 @@ class DebeedApp:
                 _file_write(f"PROMPT: {prompt.rstrip()}\n")
 
             p = prompt.lower()
-            if "retry" in p:
+            if "::select::" in p:
+                kind = "select"
+            elif "retry" in p:
                 kind = "retry"
             elif "(y/n)" in p or "y/n" in p:
                 kind = "yes_no"
@@ -915,6 +943,8 @@ class DebeedApp:
                 self._panel_folder(prompt)
             elif kind == "retry":
                 self._panel_retry(prompt)
+            elif kind == "select":
+                self._panel_select(prompt)
             else:
                 self._panel_continue(prompt)
         except queue.Empty:

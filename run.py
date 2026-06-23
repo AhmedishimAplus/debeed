@@ -856,8 +856,8 @@ def collect_image_mapping(types: list) -> dict:
 
     return mapping
 
-def confirm_mapping(mapping: dict) -> bool:
-    # Mapping may be per-project (nested) or flat (type->files). Detect shape.
+def _print_mapping_summary(mapping: dict):
+    """Print the IMAGE MAPPING SUMMARY block. Shared by confirm + fix flow."""
     print(f"\n{'═'*50}")
     print("  IMAGE MAPPING SUMMARY")
     print(f"{'─'*50}")
@@ -884,12 +884,139 @@ def confirm_mapping(mapping: dict) -> bool:
             print(f"  {t:<20} →  {len(files)} image(s)")
             print(f"  {'':20}    {folder}")
     print(f"{'═'*50}")
+
+
+def confirm_mapping(mapping: dict) -> bool:
+    # Mapping may be per-project (nested) or flat (type->files). Detect shape.
+    _print_mapping_summary(mapping)
     while True:
         ans = input_with_timeout("\n  Look good? Start? (y/n): ",
                                  timeout=UPLOAD_PROMPT_TIMEOUT, default="y").strip().lower()
         if ans == "y": return True
         if ans == "n": return False
         print("  Enter y or n.")
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  "ALL GOOD?" FIX FLOW  —  press 'n' to repair paths / behaviour
+# ═══════════════════════════════════════════════════════════════════
+_SELECT_MARK = "::SELECT::"
+
+
+def _ask_select(question: str, options: list) -> str:
+    """Picker. GUI -> buttons (via _SELECT_MARK encoding). Terminal -> type the
+    project name. Returns the chosen option's exact label. Loops until valid."""
+    gui = getattr(sys.modules.get('run') or sys.modules.get(__name__),
+                  '_GUI_MODE', False)
+    if gui:
+        payload = f"{question}\n{_SELECT_MARK}" + "||".join(options)
+        while True:
+            ans = input(payload).strip()
+            for o in options:
+                if ans.lower() == o.lower():
+                    return o
+    else:
+        print(f"\n  {question}")
+        for o in options:
+            print(f"    - {o}")
+        while True:
+            ans = input("  Type the name: ").strip()
+            for o in options:
+                if ans.lower() == o.lower():
+                    return o
+            print(f"  Enter one of: {', '.join(options)}")
+
+
+def _reask_type_path(mapping: dict, proj: str, t: str):
+    """Re-collect the folder for one [proj -> type]. Loops on bad path."""
+    while True:
+        try:
+            files = validate_folder(clean_path(
+                input(f"\n  New folder path for [{proj} -> {t}]: ")))
+            print(f"  ✓ {len(files)} image(s) found")
+            mapping[proj][t] = files
+            return
+        except FileNotFoundError as e:
+            print(f"  ✗ {e} — try again")
+
+
+def _reask_same_for_all(mapping: dict, proj: str):
+    """Re-collect the single global folder for a same-for-all project."""
+    while True:
+        try:
+            files = validate_folder(clean_path(
+                input(f"\n  New folder path for project '{proj}' (all types): ")))
+            print(f"  ✓ {len(files)} image(s) found")
+            mapping[proj]['_images'] = files
+            mapping[proj]['_same_for_all'] = True
+            return
+        except FileNotFoundError as e:
+            print(f"  ✗ {e} — try again")
+
+
+def _fix_one_project(mapping, states, proj, is_new, scanned_types,
+                     new_types_this_page):
+    """Repair one project. New project -> behaviour-or-path. Old project ->
+    path only, for the types newly scanned on the current page."""
+    pdata = mapping.setdefault(proj, {"_same_for_all": False})
+    if is_new:
+        kind = _ask_select(
+            f"[{proj}] Image upload behaviour issue or path issue?",
+            ["Behaviour issue", "Path issue"])
+        if kind == "Behaviour issue":
+            # Re-run same/different + re-collect everything for this project.
+            sub = collect_image_mapping_per_project({proj: scanned_types})
+            mapping[proj] = sub[proj]
+            states[proj] = UploadErrorState(
+                same_images_mode=mapping[proj].get('_same_for_all', False))
+            return
+        # Path issue.
+        if pdata.get('_same_for_all'):
+            _reask_same_for_all(mapping, proj)
+        else:
+            for t in [t for t in pdata if not t.startswith('_')]:
+                _reask_type_path(mapping, proj, t)
+    else:
+        # Old project: path issue only, re-ask just the newly found units.
+        targets = new_types_this_page or [t for t in pdata if not t.startswith('_')]
+        for t in targets:
+            _reask_type_path(mapping, proj, t)
+
+
+def _resolve_all_good(mapping, states, scanned_types,
+                      new_projects, new_types_by_proj):
+    """Show the mapping summary and ask 'All good?'. On 'n', let the user pick a
+    project and repair it, then re-summarize and re-ask. Loops forever until the
+    user confirms 'y' (or the 2-minute timer expires -> auto 'y'). Never aborts.
+
+    Picker visibility = projects changed on this event:
+      page 1  -> every project (all first-scan)
+      page 2+ -> new projects + old projects that gained new types this page
+    (Old same-for-all projects gain no new types -> never listed -> invisible.)
+    """
+    visible = list(dict.fromkeys(
+        list(new_projects) + list(new_types_by_proj.keys())))
+    while True:
+        _print_mapping_summary(mapping)
+        ans = input_with_timeout("\n  All good? (y/n): ",
+                                 timeout=UPLOAD_PROMPT_TIMEOUT,
+                                 default="y").strip().lower()
+        if ans == "y":
+            return
+        if ans != "n":
+            print("  Enter y or n.")
+            continue
+        if not visible:
+            print("  Nothing on this page to fix — continuing.")
+            return
+        proj = (visible[0] if len(visible) == 1
+                else _ask_select("Which project has the problem?", visible))
+        _fix_one_project(
+            mapping, states, proj,
+            is_new=(proj in new_projects),
+            scanned_types=scanned_types.get(proj, []),
+            new_types_this_page=new_types_by_proj.get(proj, []))
+        # loop -> re-summarize -> re-ask "All good?"
 
 def update_image_mapping(existing_mapping: dict, new_types: list) -> dict:
     """
@@ -1936,12 +2063,15 @@ def main():
             return
 
         mapping = collect_image_mapping_per_project(project_types)
-        if not confirm_mapping(mapping):
-            print("\n  Cancelled.")
-            return
 
         # Per-project upload error state tracker
         states = { proj: UploadErrorState(same_images_mode=mapping[proj].get('_same_for_all', False)) for proj in mapping }
+
+        # "All good?" — on 'n' the user repairs paths/behaviour, then re-confirms.
+        # Page 1: every project is first-scan, so all are fixable. Never aborts.
+        _resolve_all_good(mapping, states, project_types,
+                          new_projects=set(project_types.keys()),
+                          new_types_by_proj={})
         print(f"   Projects configured: {', '.join(mapping.keys())}")
 
         results  = []
@@ -2092,13 +2222,16 @@ def main():
             print(f"\n  ↳ Page {page_num} fully loaded. Scanning for projects/types…")
             current_projects = scan_projects_types(page)
             if current_projects:
-                # For each project on the page, adapt mapping as needed
+                # Collect this page's changes, then run ONE "All good?" for the page.
+                page_new_projects = set()   # projects first seen on this page
+                page_new_types    = {}      # old project -> [types new this page]
                 for proj, types in current_projects.items():
                     if proj not in mapping:
                         print(f"\n  New project found: {proj} — requesting image folders")
                         new_map = collect_image_mapping_per_project({proj: types})
                         mapping.update(new_map)
                         states[proj] = UploadErrorState(same_images_mode=mapping[proj].get('_same_for_all', False))
+                        page_new_projects.add(proj)
                     else:
                         if mapping[proj].get('_same_for_all'):
                             print(f"\n  Skipping per-type checks for project '{proj}' — _same_for_all=True")
@@ -2107,20 +2240,27 @@ def main():
                         new_types = [t for t in types if t not in mapping[proj]]
                         if not new_types:
                             print(f"\n  No new types for project '{proj}' — nothing to prompt")
-                        if new_types:
-                            updated = update_image_mapping(mapping, [(proj, t) for t in new_types])
-                            if updated is None:
-                                print("\n  Cancelled.")
-                                abort = True
-                                break
-                            mapping = updated
-                
-                # After scanning and potential mapping updates, proceed automatically
+                        else:
+                            # Collect paths for the new types (keeps the timed-donor fallback).
+                            for t in new_types:
+                                mapping[proj][t] = collect_path_for_new_type(proj, t)
+                            page_new_types[proj] = new_types
+
+                # After scanning + collecting, show what's on the page.
                 print(f"\n  Scanned projects on page {page_num}:")
                 for p, ts in current_projects.items():
                     print(f"    {p}: {', '.join(ts)}")
+
+                # "All good?" only when something was newly scanned this page.
+                # On 'n': new project -> behaviour-or-path, old project -> re-ask
+                # the newly found units' paths only. Never aborts; loops til 'y'.
+                if page_new_projects or page_new_types:
+                    _resolve_all_good(mapping, states, current_projects,
+                                      new_projects=page_new_projects,
+                                      new_types_by_proj=page_new_types)
+
                 print(f"  ↳ Proceeding to process page {page_num}…")
-            
+
             if abort:
                 break
 
