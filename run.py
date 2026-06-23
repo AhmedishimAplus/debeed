@@ -92,6 +92,31 @@ class UnitSkipped(Exception):
     pass
 
 
+class VersionRefresh(Exception):
+    """Raised when the Frappe 'Version Updated' modal is detected (MutationObserver,
+    networkidle wrapper, upload-JS throw, or the GUI 'Refresh Page' button). Caught
+    in main() → reload _filtered_list_url, rescan, reprocess from card 1. Run data
+    (mapping, states, results, _successful_uploads) is preserved."""
+    pass
+
+
+# Set True the instant the Version Updated modal appears: the in-browser
+# MutationObserver calls the exposed Python fn (__onVersionModal), or the GUI
+# 'Refresh Page' button sets it. Read by _check_version_refresh / the networkidle
+# wrapper to raise VersionRefresh. Cleared after each reload. Cross-thread: GUI
+# main thread sets it, automation thread reads it (atomic bool assign).
+_version_refresh_pending = False
+
+# Which layer noticed the modal — for the log, so the unpredictable real modal
+# tells us how it was caught: "observer" / "networkidle" / "upload" / "checkpoint"
+# / "manual button". Set alongside _version_refresh_pending.
+_version_detected_by = ""
+
+# Hook installed by gui.py: called once _filtered_list_url is saved so the GUI can
+# reveal its 'Refresh Page' button. None in terminal mode. Signature: () -> None
+_notify_url_saved = None
+
+
 # Hook installed by gui.py so a timed-out prompt can release the blocked GUI
 # input and dismiss its panel. None in terminal mode. Signature: (default) -> None
 _cancel_gui_input = None
@@ -180,6 +205,154 @@ def _dismiss_upload_modals(page):
             page.locator(MODAL).wait_for(state="hidden", timeout=SLOW_TIMEOUT)
     except Exception:
         pass
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  "VERSION UPDATED" MODAL  →  REFRESH FROM SAVED FILTERED LIST
+# ═══════════════════════════════════════════════════════════════════
+# Frappe shows a "Version Updated" msgprint dialog at random mid-run. Its own
+# "Refresh" button reloads the detail page (wrong — loses our place). Instead we
+# reload the saved filtered list, rescan, and reprocess from card 1. The
+# non_published_units=1 filter drops already-published units, so the replay only
+# touches units that still need work.
+_VERSION_MODAL_TITLE = "Version Updated"
+
+# In-browser MutationObserver: fires the instant the modal is added to the DOM and
+# calls the exposed Python fn. add_init_script re-installs it on every navigation.
+_VERSION_OBSERVER_JS = """
+    (() => {
+        if (window.__versionObserverInstalled) return;
+        window.__versionObserverInstalled = true;
+        window.__versionPending = false;
+        const check = () => {
+            for (const d of document.querySelectorAll('.modal-dialog.msgprint-dialog')) {
+                const t = d.querySelector('.modal-title, .modal-header, h4');
+                if (t && t.innerText.includes('Version Updated')) {
+                    window.__versionPending = true;
+                    if (window.__onVersionModal) { try { window.__onVersionModal(); } catch (e) {} }
+                    return true;
+                }
+            }
+            return false;
+        };
+        check();  // catch a modal already present at install time
+        const obs = new MutationObserver(check);
+        obs.observe(document.documentElement, { childList: true, subtree: true });
+    })();
+"""
+
+
+def _version_modal_visible(page) -> bool:
+    """Instant JS DOM check for the 'Version Updated' dialog. Matched by
+    .modal-dialog.msgprint-dialog + title text so it never collides with the
+    upload sub-modal (.modal.fade.show)."""
+    try:
+        return bool(page.evaluate(
+            """(title) => {
+                for (const d of document.querySelectorAll('.modal-dialog.msgprint-dialog')) {
+                    const t = d.querySelector('.modal-title, .modal-header, h4');
+                    if (t && t.innerText.includes(title)) return true;
+                }
+                return false;
+            }""",
+            _VERSION_MODAL_TITLE,
+        ))
+    except Exception:
+        return False
+
+
+def _check_version_refresh(page=None):
+    """Checkpoint: raise VersionRefresh if a refresh is pending (observer or GUI
+    button set the flag) or — when `page` is given — the modal is on screen now."""
+    global _version_refresh_pending, _version_detected_by
+    if _version_refresh_pending:
+        raise VersionRefresh("refresh requested")
+    if page is not None and _version_modal_visible(page):
+        _version_refresh_pending = True
+        if not _version_detected_by:
+            _version_detected_by = "checkpoint"
+        raise VersionRefresh("Version Updated modal detected")
+
+
+def _mark_detected(src: str):
+    """Flag a refresh and record which layer caught the modal (for the log)."""
+    global _version_refresh_pending, _version_detected_by
+    _version_refresh_pending = True
+    if not _version_detected_by:
+        _version_detected_by = src
+
+
+def _safe_wait_networkidle(page, timeout=SLOW_TIMEOUT, chunk=3000):
+    """Drop-in for page.wait_for_load_state('networkidle', timeout=SLOW_TIMEOUT).
+    Same slow-CRM behaviour — waits up to the full timeout — but polls in short
+    chunks so a pending Version Updated refresh is acted on within ~chunk ms
+    instead of hanging the full timeout. (The modal keeps the network busy, so a
+    plain networkidle wait would otherwise stall for the entire SLOW_TIMEOUT.)"""
+    global _version_refresh_pending, _version_detected_by
+    elapsed = 0
+    while elapsed < timeout:
+        if _version_refresh_pending:
+            raise VersionRefresh("refresh requested during networkidle")
+        try:
+            page.wait_for_load_state("networkidle", timeout=chunk)
+            return
+        except Exception:
+            if _version_refresh_pending or _version_modal_visible(page):
+                _version_refresh_pending = True   # persist so try-wrapped sites still recover
+                if not _version_detected_by:
+                    _version_detected_by = "networkidle"
+                raise VersionRefresh("Version Updated modal during networkidle")
+            elapsed += chunk
+    # Full timeout elapsed without a modal — networkidle is best-effort, proceed.
+
+
+def _reload_saved_list(page):
+    """Reload the saved filtered list URL in the existing tab (NOT a new tab), then
+    wait for the cards. Uses a HARD reload — the Version Updated modal means the app
+    bundle changed, and a soft same-URL goto would not pull the new frontend (the
+    page stays frozen). page.reload() reloads fresh, like the modal's own Refresh
+    button. Clears the refresh flag. Shared by modal recovery + manual button."""
+    global _version_refresh_pending, _version_detected_by
+    _version_refresh_pending = False   # clear before reload so the observer can re-arm
+    why = _version_detected_by or "refresh"
+    print(f"   🔄 Version Updated — reloading the saved filtered list… (detected by: {why})")
+    print(f"   ↳ URL: {_filtered_list_url}")
+
+    # Step 1: point the tab at the saved list URL (domcontentloaded so goto doesn't
+    # block on a frozen 'load' event).
+    try:
+        page.goto(_filtered_list_url, timeout=SLOW_TIMEOUT, wait_until="domcontentloaded")
+    except Exception as e:
+        print(f"   ⚠ goto hiccup: {e} — continuing")
+    # Step 2: HARD reload to force the updated app bundle (equivalent to F5 /
+    # the modal's Refresh). This is what actually clears the frozen state.
+    try:
+        page.reload(timeout=SLOW_TIMEOUT, wait_until="domcontentloaded")
+    except Exception as e:
+        print(f"   ⚠ reload hiccup: {e} — continuing")
+
+    # Step 3: wait out the loading overlay — BOUNDED so it can never hang forever.
+    # If it still hasn't cleared after a few long waits, hard-reload again.
+    print("   ↳ Waiting for the loading overlay to clear…")
+    for attempt in range(3):
+        try:
+            page.wait_for_selector(".freeze-message-container", state="hidden", timeout=SLOW_TIMEOUT)
+            break
+        except Exception:
+            print(f"   ⚠ Overlay still up (attempt {attempt + 1}/3) — hard-reloading again…")
+            try:
+                page.reload(timeout=SLOW_TIMEOUT, wait_until="domcontentloaded")
+            except Exception:
+                pass
+
+    # Step 4: wait for the cards to render.
+    try:
+        page.wait_for_selector("div.card.cursor-pointer.rounded-0", state="visible", timeout=SLOW_TIMEOUT)
+    except Exception:
+        pass
+    _version_refresh_pending = False
+    _version_detected_by = ""
+    _version_refresh_pending = False
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -531,7 +704,7 @@ def detect_active_view(page: Page) -> str:
 #  SCAN PAGE → UNIQUE UNIT TYPES
 # ═══════════════════════════════════════════════════════════════════
 def scan_unit_types(page: Page) -> list:
-    page.wait_for_load_state("networkidle", timeout=SLOW_TIMEOUT)
+    _safe_wait_networkidle(page)
     page.wait_for_selector("div.card.cursor-pointer.rounded-0", timeout=SLOW_TIMEOUT)
 
     print(f"   DEBUG: Scanning for unit cards...")
@@ -554,7 +727,7 @@ def scan_unit_types(page: Page) -> list:
 
 def scan_projects_types(page: Page) -> dict:
     """Scan the page and return a mapping of project -> list of unit types."""
-    page.wait_for_load_state("networkidle", timeout=SLOW_TIMEOUT)
+    _safe_wait_networkidle(page)
     page.wait_for_selector("div.card.cursor-pointer.rounded-0", timeout=SLOW_TIMEOUT)
     # Read directly from the card grid to avoid multiline noise (dates, BUA, etc.)
     cards = page.locator("div.card.cursor-pointer.rounded-0")
@@ -853,7 +1026,7 @@ def go_back_to_list(page: Page):
     except Exception:
         pass  # Overlay might not exist, continue anyway
     page.locator("button, a", has_text=re.compile(r"\bBack\b", re.IGNORECASE)).first.click(timeout=SLOW_TIMEOUT)
-    page.wait_for_load_state("networkidle", timeout=SLOW_TIMEOUT)
+    _safe_wait_networkidle(page)
     page.wait_for_selector("div.card.cursor-pointer.rounded-0", timeout=SLOW_TIMEOUT)
 
     # Close any open detail tabs so the next card always opens fresh.
@@ -1011,6 +1184,8 @@ def step_upload_images(page: Page, paths: list, project: str, unit_type: str, st
     try:
         page.wait_for_function(
             """() => {
+                // Bail instantly if the Version Updated modal is up (set by observer).
+                if (window.__versionPending) throw new Error('VERSION_UPDATED_MODAL');
                 const rows = document.querySelectorAll('.file-preview-container .file-preview');
                 // If no rows found, might be different upload state — just return true to proceed
                 if (rows.length === 0) {
@@ -1030,7 +1205,13 @@ def step_upload_images(page: Page, paths: list, project: str, unit_type: str, st
             )
         print("   ✓ All uploads settled")
         confirm("STEP 1 — Images uploaded. Verify they appeared.")
+    except VersionRefresh:
+        raise
     except Exception as e:
+        # The upload JS throws VERSION_UPDATED_MODAL if the modal appears mid-wait.
+        if 'VERSION_UPDATED_MODAL' in str(e) or _version_refresh_pending or _version_modal_visible(page):
+            _mark_detected("upload")
+            raise VersionRefresh("Version Updated modal during upload wait")
         print(f"   ⚠ Timeout waiting for upload results ({e}) — continuing anyway")
         page.wait_for_selector('.file-preview-container .file-preview', timeout=SLOW_TIMEOUT)
 
@@ -1377,6 +1558,9 @@ def step_publish(page: Page, n_images: int):
 #  PROCESS ONE UNIT
 # ═══════════════════════════════════════════════════════════════════
 def process_unit(page: Page, url: str, name: str, mapping: dict, states: dict):
+    # Bail before any work if a refresh is pending (modal / GUI button).
+    _check_version_refresh(page)
+
     # Resolve project and type from name
     parsed_project, parsed_type = extract_project_and_type(name)
 
@@ -1423,7 +1607,7 @@ def process_unit(page: Page, url: str, name: str, mapping: dict, states: dict):
     print(f"   Project: {project}  |  Type: {utype}  |  {len(images)} image(s)")
     if url:
         page.goto(url)
-        page.wait_for_load_state("networkidle", timeout=SLOW_TIMEOUT)
+        _safe_wait_networkidle(page)
 
     # ── Check if unit is already published ──────────────────────────
     publish_status = check_publish_status(page)
@@ -1488,7 +1672,13 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
                     go_back_to_list(page)
                 except Exception as ge:
                     print(f"   ⚠ Could not return to list cleanly: {ge}")
+            except VersionRefresh:
+                raise   # bubble to main() → reload saved list, replay from card 1
             except Exception as e:
+                # A modal that slipped past the checkpoints surfaces as a generic
+                # error — convert to a refresh instead of stalling on the prompt.
+                if _version_refresh_pending or _version_modal_visible(page):
+                    raise VersionRefresh("Version Updated during unit")
                 print(f"  ✗ ERROR: {e}")
                 results.append({"page": page_num, "unit": name, "url": url, "status": f"FAILED: {e}"})
                 input("  ⚠ Fix manually if needed, then press Enter to continue… ")
@@ -1536,13 +1726,13 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
             
             # Make sure we are on the list page before clicking
             if "RESALE-" in page.url:
-                page.wait_for_load_state("networkidle")
+                _safe_wait_networkidle(page)
 
             card_el.scroll_into_view_if_needed()
             print(f"   [DEBUG] Click executing...")
             card_el.click(timeout=SLOW_TIMEOUT)
             print(f"   [DEBUG] Click executed - waiting for navigation...")
-            page.wait_for_load_state("networkidle", timeout=SLOW_TIMEOUT)
+            _safe_wait_networkidle(page)
 
             # POST-CLICK DIAGNOSTICS
             print(f"   [DEBUG] After click - New URL: {page.url}")
@@ -1579,7 +1769,13 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
                 go_back_to_list(page)
             except Exception as ge:
                 print(f"   ⚠ Could not return to list cleanly: {ge}")
+        except VersionRefresh:
+            raise   # bubble to main() → reload saved list, replay from card 1
         except Exception as e:
+            # A modal that slipped past the checkpoints surfaces as a generic
+            # error — convert to a refresh instead of stalling on the prompt.
+            if _version_refresh_pending or _version_modal_visible(page):
+                raise VersionRefresh("Version Updated during unit")
             print(f"  ✗ ERROR: {e}")
             results.append({"page": page_num, "unit": name, "url": page.url, "status": f"FAILED: {e}"})
             input("  ⚠ Fix manually if needed, then press Enter to continue… ")
@@ -1644,6 +1840,32 @@ def main():
         # Show the connection only after the user has navigated.
         print(f"\n✅  Connected  |  {page.url}")
 
+        # Install the Version Updated detector. The MutationObserver fires the
+        # instant the modal is added to the DOM and calls this exposed fn, which
+        # sets the flag (~1ms). add_init_script re-installs the observer on every
+        # navigation; evaluate runs it once on the page already loaded. Wrapped in
+        # try/except so a missing API or a re-register never aborts the run.
+        global _version_refresh_pending
+        _version_refresh_pending = False
+
+        def _on_version_modal():
+            global _version_refresh_pending, _version_detected_by
+            _version_refresh_pending = True
+            _version_detected_by = "observer"
+
+        try:
+            page.expose_function("__onVersionModal", _on_version_modal)
+        except Exception as _e:
+            print(f"   ℹ Version-modal callback already registered ({_e})")
+        try:
+            page.add_init_script(_VERSION_OBSERVER_JS)
+        except Exception as _e:
+            print(f"   ℹ add_init_script unavailable ({_e}) — relying on post-wait checks")
+        try:
+            page.evaluate(_VERSION_OBSERVER_JS)   # arm on the current page too
+        except Exception:
+            pass
+
         # Detect which tab is active BEFORE scanning. Rent reuses the whole flow
         # but skips price/down-payment logic. Only Rent and Re-Sale are valid —
         # Primary/unknown means the user is on the wrong tab, so block with a
@@ -1675,7 +1897,7 @@ def main():
             except Exception as e:
                 print(f"   ⚠ Reload hiccup: {e} — continuing")
             try:
-                page.wait_for_load_state("networkidle", timeout=SLOW_TIMEOUT)
+                _safe_wait_networkidle(page)
             except Exception:
                 pass
             print("   ⏳ Waiting for the loading overlay to clear…")
@@ -1691,8 +1913,24 @@ def main():
                 pass
             print("   ✓ List reloaded")
 
+        # URL captured & saved — let the GUI reveal its 'Refresh Page' button.
+        if callable(_notify_url_saved):
+            try:
+                _notify_url_saved()
+            except Exception:
+                pass
+
         print("  Scanning page for projects and unit types…")
-        project_types = scan_projects_types(page)
+        # Initial scan is the spot the modal was seen first — retry it through a
+        # reload if Version Updated pops up here.
+        while True:
+            try:
+                project_types = scan_projects_types(page)
+                break
+            except VersionRefresh:
+                _reload_saved_list(page)
+                print("   ↳ Rescanning after refresh…")
+                continue
         if not project_types:
             print("  ✗ No unit projects/types found. Are you on the list page?")
             return
@@ -1711,7 +1949,17 @@ def main():
         abort = False
 
         while True:
-            process_current_page(page, mapping, page_num, results, states)
+            # Version Updated modal anywhere inside → VersionRefresh bubbles here.
+            # Reload the saved list (published units drop off via non_published=1),
+            # then replay this page from card 1. page_num kept for log continuity.
+            try:
+                process_current_page(page, mapping, page_num, results, states)
+            except VersionRefresh:
+                _reload_saved_list(page)
+                new_count = page.locator("div.card.cursor-pointer.rounded-0").count()
+                print(f"   ✓ List reloaded  —  {new_count} unit(s) remaining")
+                print(f"   ↳ Resuming page {page_num}, card 1 of {new_count}")
+                continue
 
             pg_ok   = sum(1 for r in results if r["page"] == page_num and r["status"] == "OK")
             pg_fail = sum(1 for r in results if r["page"] == page_num and r["status"] != "OK")
@@ -1743,7 +1991,7 @@ def main():
                 if ans == "done":
                     break
                 page_num += 1
-                page.wait_for_load_state("networkidle")
+                _safe_wait_networkidle(page)
                 continue
 
             # If we're on the last page, finish and exit the loop
@@ -1778,7 +2026,7 @@ def main():
 
             # Layered waits to ensure the new page has rendered
             try:
-                page.wait_for_load_state("networkidle", timeout=SLOW_TIMEOUT)
+                _safe_wait_networkidle(page)
             except Exception:
                 pass
             try:
@@ -1828,7 +2076,7 @@ def main():
                         page.wait_for_selector(".freeze-message-container", state="hidden", timeout=SLOW_TIMEOUT)
                     except Exception:
                         pass
-                    page.wait_for_load_state("networkidle", timeout=SLOW_TIMEOUT)
+                    _safe_wait_networkidle(page)
                     page.wait_for_selector("div.card.cursor-pointer.rounded-0", state="visible", timeout=SLOW_TIMEOUT)
                     try:
                         page_num = int(page.locator("input[type='number']").last.input_value().strip())

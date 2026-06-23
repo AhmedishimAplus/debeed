@@ -236,6 +236,16 @@ class DebeedApp:
                   command=self._save_log,
                   ).pack(side=tk.LEFT)
 
+        # Created but not packed — revealed once run.main() saves the filter URL
+        # (see _on_url_saved). Reloads from that saved list, mid-run, on demand.
+        self._btn_refresh = tk.Button(self._btn_left,
+                                      text="🔄  Refresh Page",
+                                      bg=BTN_BLUE_BG, fg=BTN_BLUE_FG,
+                                      font=("Segoe UI", 9, "bold"),
+                                      relief=tk.FLAT, padx=12, pady=5,
+                                      cursor="hand2",
+                                      command=self._refresh_page)
+
         # Created but not packed — shown only after completion
         self._btn_results = tk.Button(self._btn_left,
                                       text="📊  Save Results",
@@ -271,7 +281,10 @@ class DebeedApp:
         instructions = (
             "1.  Please make sure the CRM tab is the one and only tab open — do not open additional tabs.\n"
             "2.  Log in to the CRM and navigate to your filtered unit list.\n"
-            "3.  Apply filters, tick  Available,  then click  Start  below."
+            "3.  Apply filters, tick  Available,  then click  Start  below.\n"
+            "4.  While it runs, do not click the new Chrome tab. If something goes wrong and\n"
+            "     you need to refresh, press  Refresh Page  to reload from the saved list.\n"
+            "     Read  PLEASE NOTE  (shown after Start) before pressing  Continue."
         )
         tk.Label(f,
                  text=instructions,
@@ -567,6 +580,26 @@ class DebeedApp:
         except Exception as e:
             messagebox.showerror("Save Failed", f"Could not save results:\n{e}", parent=self.root)
 
+    def _refresh_page(self):
+        """Manual refresh: reload from the saved filtered list and replay from the
+        first card. Sets the shared flag; the automation thread picks it up at its
+        next checkpoint/wait and does the reload on its own thread (Playwright is
+        not thread-safe, so the GUI never touches the page directly)."""
+        if not self._started:
+            return
+        if getattr(_run, "_version_refresh_pending", False):
+            self._append_log("  🔄  Refresh already pending…\n")
+            return
+        _run._version_detected_by = "manual button"
+        _run._version_refresh_pending = True
+        self._append_log("  🔄  Refresh Page pressed — reloading from the saved list "
+                         "at the next safe point…\n")
+
+    def _on_url_saved(self):
+        """Hook from run.main(): the saved filter URL now exists → reveal the
+        Refresh Page button. Called from the automation thread → go via the queue."""
+        self._log_q.put(("show_refresh", None))
+
     def _ask_keep_log(self):
         self._keep_log_after = None
         keep = messagebox.askyesno(
@@ -645,6 +678,7 @@ class DebeedApp:
 
         # 4. Re-initialise run state (memory only — no image files touched).
         _run._pending_results = None
+        _run._version_refresh_pending = False
         try:
             _run._successful_uploads.clear()
         except Exception:
@@ -673,6 +707,7 @@ class DebeedApp:
         self._prog["value"] = 0
         self._unit_counter.set("")
         self._status_var.set("Starting new operation…")
+        self._btn_refresh.pack_forget()   # re-revealed when the new run saves its URL
         self._btn_results.pack_forget()
         self._btn_results.config(state=tk.NORMAL, text="📊  Save Results")
         self._log_cleaned = False
@@ -793,6 +828,9 @@ class DebeedApp:
         # Let run.py's timed prompts release this blocked input on timeout.
         _run._cancel_gui_input = self._timeout_input
 
+        # Let run.main() reveal the Refresh Page button once it saves the filter URL.
+        _run._notify_url_saved = self._on_url_saved
+
     # ═══════════════════════════════════════════════════════════════
     #  LOG RENDERING
     # ═══════════════════════════════════════════════════════════════
@@ -861,6 +899,9 @@ class DebeedApp:
                     self._append_log(payload)
                 elif kind == "dismiss":
                     self._panel_running()
+                elif kind == "show_refresh":
+                    if not self._btn_refresh.winfo_ismapped():
+                        self._btn_refresh.pack(side=tk.LEFT, padx=(8, 0))
                 elif kind == "done":
                     self._panel_complete()
         except queue.Empty:
