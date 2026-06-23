@@ -217,6 +217,23 @@ def _dismiss_upload_modals(page):
 # touches units that still need work.
 _VERSION_MODAL_TITLE = "Version Updated"
 
+# Shared detection body — used by BOTH the observer and the instant Python check.
+# The Version Updated dialog is a PLAIN Frappe modal (NOT a .msgprint-dialog), so
+# the old class-based match never fired. Match instead on:
+#   • its title  "Version Updated"  in any header element, OR
+#   • its unique body sentence  "has been updated to a new version"  visible on the
+#     page (only present while the modal is shown).
+# Neither string appears in the upload sub-modal, so there is no collision.
+_VERSION_CHECK_BODY = """
+    const SIG = 'has been updated to a new version';
+    const TITLE = 'Version Updated';
+    for (const t of document.querySelectorAll('.modal-title, .modal-header, h3, h4, h5, h6')) {
+        if ((t.textContent || '').includes(TITLE)) return true;
+    }
+    if (((document.body && document.body.innerText) || '').includes(SIG)) return true;
+    return false;
+"""
+
 # In-browser MutationObserver: fires the instant the modal is added to the DOM and
 # calls the exposed Python fn. add_init_script re-installs it on every navigation.
 _VERSION_OBSERVER_JS = """
@@ -225,38 +242,26 @@ _VERSION_OBSERVER_JS = """
         window.__versionObserverInstalled = true;
         window.__versionPending = false;
         const check = () => {
-            for (const d of document.querySelectorAll('.modal-dialog.msgprint-dialog')) {
-                const t = d.querySelector('.modal-title, .modal-header, h4');
-                if (t && t.innerText.includes('Version Updated')) {
-                    window.__versionPending = true;
-                    if (window.__onVersionModal) { try { window.__onVersionModal(); } catch (e) {} }
-                    return true;
-                }
+            const hit = (() => { %s })();
+            if (hit) {
+                window.__versionPending = true;
+                if (window.__onVersionModal) { try { window.__onVersionModal(); } catch (e) {} }
             }
-            return false;
+            return hit;
         };
         check();  // catch a modal already present at install time
         const obs = new MutationObserver(check);
         obs.observe(document.documentElement, { childList: true, subtree: true });
     })();
-"""
+""" % _VERSION_CHECK_BODY
 
 
 def _version_modal_visible(page) -> bool:
-    """Instant JS DOM check for the 'Version Updated' dialog. Matched by
-    .modal-dialog.msgprint-dialog + title text so it never collides with the
-    upload sub-modal (.modal.fade.show)."""
+    """Instant JS DOM check for the 'Version Updated' dialog. Matched by title text
+    or its unique body sentence, so it never collides with the upload sub-modal
+    (.modal.fade.show)."""
     try:
-        return bool(page.evaluate(
-            """(title) => {
-                for (const d of document.querySelectorAll('.modal-dialog.msgprint-dialog')) {
-                    const t = d.querySelector('.modal-title, .modal-header, h4');
-                    if (t && t.innerText.includes(title)) return true;
-                }
-                return false;
-            }""",
-            _VERSION_MODAL_TITLE,
-        ))
+        return bool(page.evaluate("() => { %s }" % _VERSION_CHECK_BODY))
     except Exception:
         return False
 
@@ -282,7 +287,35 @@ def _mark_detected(src: str):
         _version_detected_by = src
 
 
-def _safe_wait_networkidle(page, timeout=SLOW_TIMEOUT, chunk=3000):
+def _safe_wait_selector(page, selector, chunk_ms=1000, **kwargs):
+    """Drop-in for page.wait_for_selector(...). NOT a checkpoint — it is the wait
+    itself made interruptible. Does the exact same wait, but in ~chunk_ms slices so
+    that if the Version Updated modal appears (observer raises the flag) it bails to
+    the reload within ~1s instead of blocking the full SLOW_TIMEOUT. Slow-CRM
+    behaviour is unchanged: with no modal it keeps waiting up to the real timeout."""
+    global _version_refresh_pending, _version_detected_by
+    timeout = kwargs.pop("timeout", SLOW_TIMEOUT)
+    elapsed = 0
+    while elapsed < timeout:
+        if _version_refresh_pending:
+            raise VersionRefresh("refresh requested during wait_for_selector")
+        step = min(chunk_ms, timeout - elapsed)
+        try:
+            return page.wait_for_selector(selector, timeout=step, **kwargs)
+        except VersionRefresh:
+            raise
+        except Exception:
+            if _version_refresh_pending or _version_modal_visible(page):
+                _version_refresh_pending = True
+                if not _version_detected_by:
+                    _version_detected_by = "wait_for_selector"
+                raise VersionRefresh("Version Updated modal during wait_for_selector")
+            elapsed += step
+    # Real timeout elapsed without a modal — surface the genuine error to the caller.
+    return page.wait_for_selector(selector, timeout=chunk_ms, **kwargs)
+
+
+def _safe_wait_networkidle(page, timeout=SLOW_TIMEOUT, chunk=1000):
     """Drop-in for page.wait_for_load_state('networkidle', timeout=SLOW_TIMEOUT).
     Same slow-CRM behaviour — waits up to the full timeout — but polls in short
     chunks so a pending Version Updated refresh is acted on within ~chunk ms
@@ -336,7 +369,7 @@ def _reload_saved_list(page):
     print("   ↳ Waiting for the loading overlay to clear…")
     for attempt in range(3):
         try:
-            page.wait_for_selector(".freeze-message-container", state="hidden", timeout=SLOW_TIMEOUT)
+            _safe_wait_selector(page, ".freeze-message-container", state="hidden")
             break
         except Exception:
             print(f"   ⚠ Overlay still up (attempt {attempt + 1}/3) — hard-reloading again…")
@@ -347,7 +380,7 @@ def _reload_saved_list(page):
 
     # Step 4: wait for the cards to render.
     try:
-        page.wait_for_selector("div.card.cursor-pointer.rounded-0", state="visible", timeout=SLOW_TIMEOUT)
+        _safe_wait_selector(page, "div.card.cursor-pointer.rounded-0", state="visible")
     except Exception:
         pass
     _version_refresh_pending = False
@@ -705,7 +738,7 @@ def detect_active_view(page: Page) -> str:
 # ═══════════════════════════════════════════════════════════════════
 def scan_unit_types(page: Page) -> list:
     _safe_wait_networkidle(page)
-    page.wait_for_selector("div.card.cursor-pointer.rounded-0", timeout=SLOW_TIMEOUT)
+    _safe_wait_selector(page, "div.card.cursor-pointer.rounded-0")
 
     print(f"   DEBUG: Scanning for unit cards...")
 
@@ -728,7 +761,7 @@ def scan_unit_types(page: Page) -> list:
 def scan_projects_types(page: Page) -> dict:
     """Scan the page and return a mapping of project -> list of unit types."""
     _safe_wait_networkidle(page)
-    page.wait_for_selector("div.card.cursor-pointer.rounded-0", timeout=SLOW_TIMEOUT)
+    _safe_wait_selector(page, "div.card.cursor-pointer.rounded-0")
     # Read directly from the card grid to avoid multiline noise (dates, BUA, etc.)
     cards = page.locator("div.card.cursor-pointer.rounded-0")
     total = cards.count()
@@ -1149,12 +1182,12 @@ def go_back_to_list(page: Page):
     print("   ↩ Going back to list page...")
     # Wait for any freeze overlay to disappear first (may take time on slow systems)
     try:
-        page.wait_for_selector(".freeze-message-container", state="hidden", timeout=SLOW_TIMEOUT)
+        _safe_wait_selector(page, ".freeze-message-container", state="hidden")
     except Exception:
         pass  # Overlay might not exist, continue anyway
     page.locator("button, a", has_text=re.compile(r"\bBack\b", re.IGNORECASE)).first.click(timeout=SLOW_TIMEOUT)
     _safe_wait_networkidle(page)
-    page.wait_for_selector("div.card.cursor-pointer.rounded-0", timeout=SLOW_TIMEOUT)
+    _safe_wait_selector(page, "div.card.cursor-pointer.rounded-0")
 
     # Close any open detail tabs so the next card always opens fresh.
     # The close button selector is button.close-button (confirmed from DOM inspection).
@@ -1166,7 +1199,7 @@ def go_back_to_list(page: Page):
         for j in range(count):
             try:
                 close_btns.nth(j).click(timeout=SLOW_TIMEOUT)
-                page.wait_for_selector("button.close-button", state="hidden", timeout=SLOW_TIMEOUT)
+                _safe_wait_selector(page, "button.close-button", state="hidden")
             except Exception:
                 # If one tab fails to close, skip it and continue with others
                 continue
@@ -1176,7 +1209,7 @@ def go_back_to_list(page: Page):
         # Tab close is not critical, just log and continue
         pass
 
-    page.wait_for_selector("div.card.cursor-pointer.rounded-0", timeout=SLOW_TIMEOUT)
+    _safe_wait_selector(page, "div.card.cursor-pointer.rounded-0")
     print("   ✓ Back to list")
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1192,7 +1225,7 @@ def decide_price(page: Page) -> str:
 
     try:
         MODAL = ".modal-mask"
-        page.wait_for_selector(MODAL, state="visible", timeout=SLOW_TIMEOUT)
+        _safe_wait_selector(page, MODAL, state="visible")
 
         # Values are inside readonly <input> elements — innerText misses them.
         # We must read .value via JavaScript directly from the DOM inputs.
@@ -1285,10 +1318,10 @@ def step_upload_images(page: Page, paths: list, project: str, unit_type: str, st
     page.locator("button", has_text="Image Manager").first.click(timeout=SLOW_TIMEOUT)
     page.locator(MODAL).wait_for(state="visible", timeout=SLOW_TIMEOUT)
     try:
-        page.wait_for_selector(f"{MODAL} button.btn-primary", timeout=SLOW_TIMEOUT)
+        _safe_wait_selector(page, f"{MODAL} button.btn-primary")
         print("   ✓ Image Manager loaded")
     except Exception:
-        page.wait_for_selector(f"{MODAL} button.btn-primary", timeout=SLOW_TIMEOUT)
+        _safe_wait_selector(page, f"{MODAL} button.btn-primary")
         print("   ✓ Image Manager opened (fallback wait)")
 
     # ── Open Upload sub-modal ──────────────────────────────────────
@@ -1340,7 +1373,7 @@ def step_upload_images(page: Page, paths: list, project: str, unit_type: str, st
             _mark_detected("upload")
             raise VersionRefresh("Version Updated modal during upload wait")
         print(f"   ⚠ Timeout waiting for upload results ({e}) — continuing anyway")
-        page.wait_for_selector('.file-preview-container .file-preview', timeout=SLOW_TIMEOUT)
+        _safe_wait_selector(page, '.file-preview-container .file-preview')
 
     # ── Check for errors (ONLY on first upload for this type) ──────
     is_first = state.is_first_upload(unit_type)
@@ -1411,7 +1444,7 @@ def step_upload_images(page: Page, paths: list, project: str, unit_type: str, st
                             print("   ✓ Upload modal closed")
                         except Exception as e:
                             print(f"   ⚠ Modal close timeout: {e} — continuing")
-                            page.wait_for_selector(UPLOAD, state="hidden", timeout=SLOW_TIMEOUT)
+                            _safe_wait_selector(page, UPLOAD, state="hidden")
                     else:
                         print("   ℹ Upload modal already closed")
                 else:
@@ -1422,7 +1455,7 @@ def step_upload_images(page: Page, paths: list, project: str, unit_type: str, st
                     except Exception:
                         try:
                             page.press("Escape")
-                            page.wait_for_selector(UPLOAD, state="hidden", timeout=SLOW_TIMEOUT)
+                            _safe_wait_selector(page, UPLOAD, state="hidden")
                         except Exception:
                             pass
                     # Close Image Manager too so user can go back to list
@@ -1473,7 +1506,7 @@ def step_upload_images(page: Page, paths: list, project: str, unit_type: str, st
                         print("   ✓ Upload modal closed")
                     except Exception as e:
                         print(f"   ⚠ Modal close timeout: {e} — continuing")
-                        page.wait_for_selector(UPLOAD, state="hidden", timeout=SLOW_TIMEOUT)
+                        _safe_wait_selector(page, UPLOAD, state="hidden")
                 else:
                     print("   ℹ Upload modal already closed")
         else:
@@ -1486,7 +1519,7 @@ def step_upload_images(page: Page, paths: list, project: str, unit_type: str, st
                     print("   ✓ Upload modal closed")
                 except Exception as e:
                     print(f"   ⚠ Modal close timeout: {e} — continuing")
-                    page.wait_for_selector(UPLOAD, state="hidden", timeout=SLOW_TIMEOUT)
+                    _safe_wait_selector(page, UPLOAD, state="hidden")
             else:
                 print("   ℹ Upload modal already closed")
 
@@ -1503,7 +1536,7 @@ def step_upload_images(page: Page, paths: list, project: str, unit_type: str, st
                 print("   ✓ Upload modal closed")
             except Exception as e:
                 print(f"   ⚠ Could not close modal: {e} — proceeding anyway")
-                page.wait_for_selector(UPLOAD, state="hidden", timeout=SLOW_TIMEOUT)
+                _safe_wait_selector(page, UPLOAD, state="hidden")
         else:
             print("   ℹ Upload modal already auto-closed, proceeding to tagging…")
 
@@ -1526,7 +1559,7 @@ def step_upload_images(page: Page, paths: list, project: str, unit_type: str, st
         if "btn-primary" in btn_class:
             continue
         tag_btn.click()
-        page.wait_for_selector(f"{MODAL} .image-wrapper.faded", timeout=SLOW_TIMEOUT)
+        _safe_wait_selector(page, f"{MODAL} .image-wrapper.faded")
         tagged += 1
 
     print(f"   ✓ Tagged {tagged} image(s)")
@@ -1558,7 +1591,7 @@ def step_publish(page: Page, n_images: int):
     print("   ↳ Opening Publish Unit (Clients) modal...")
     page.locator("button", has_text="Publish Unit (Clients)").first.click(timeout=SLOW_TIMEOUT)
     page.locator(MODAL).wait_for(state="visible", timeout=SLOW_TIMEOUT)
-    page.wait_for_selector("text=Price Display", timeout=SLOW_TIMEOUT)
+    _safe_wait_selector(page, "text=Price Display")
     print("   ✓ Modal open")
 
     # ── Price display (Fields tab is default) ──────────────────────
@@ -1612,7 +1645,7 @@ def step_publish(page: Page, n_images: int):
     # ── Switch to Images tab ───────────────────────────────────────
     print("   ── Switching to Images tab…")
     page.locator(f"{MODAL} button", has_text="Images").click()
-    page.wait_for_selector(f"{MODAL} .col-6.col-md-3.col-lg-3.py-2", timeout=SLOW_TIMEOUT)
+    _safe_wait_selector(page, f"{MODAL} .col-6.col-md-3.col-lg-3.py-2")
     confirm("STEP 5 — Images tab open. Select your images.")
 
     # ── Select the N newest images ─────────────────────────────────
@@ -1627,7 +1660,7 @@ def step_publish(page: Page, n_images: int):
         wrapper_class = wrapper.get_attribute("class") or ""
         if "faded" in wrapper_class:
             wrapper.click()
-            page.wait_for_selector(f"{MODAL} .col-6.col-md-3.col-lg-3.py-2", timeout=SLOW_TIMEOUT)
+            _safe_wait_selector(page, f"{MODAL} .col-6.col-md-3.col-lg-3.py-2")
             selected += 1
         else:
             selected += 1
@@ -1636,20 +1669,20 @@ def step_publish(page: Page, n_images: int):
 
     # ── Check Published checkbox ───────────────────────────────────
     page.locator(f"{MODAL} button", has_text="Fields").click()
-    page.wait_for_selector("text=Price Display", timeout=SLOW_TIMEOUT)
+    _safe_wait_selector(page, "text=Price Display")
 
     try:
         published_cb = page.locator(f"{MODAL}").get_by_text("Published", exact=False).last.locator("ancestor::label input[type='checkbox']")
         if not published_cb.is_checked():
             published_cb.check()
-            page.wait_for_selector(f"{MODAL} input[type='checkbox']", timeout=SLOW_TIMEOUT)
+            _safe_wait_selector(page, f"{MODAL} input[type='checkbox']")
             print("   ✓ Published checkbox enabled")
     except Exception:
         try:
             published_cb = page.locator(f"{MODAL} input[type='checkbox']").last
             if not published_cb.is_checked():
                 published_cb.check()
-                page.wait_for_selector(f"{MODAL} input[type='checkbox']", timeout=SLOW_TIMEOUT)
+                _safe_wait_selector(page, f"{MODAL} input[type='checkbox']")
                 print("   ✓ Published checkbox enabled")
         except Exception as e:
             print(f"   ⚠ Could not find Published checkbox: {e}")
@@ -1665,13 +1698,13 @@ def step_publish(page: Page, n_images: int):
         print("   ✓ Modal closed — save confirmed")
     except Exception:
         print("   ⚠ Modal did not close in expected time — continuing anyway")
-        page.wait_for_selector(MODAL, state="hidden", timeout=SLOW_TIMEOUT)
+        _safe_wait_selector(page, MODAL, state="hidden")
 
     # ── Wait for freeze overlay to disappear (system freeze message) ──
     # The CRM shows a freeze-message-container during processing that blocks clicks.
     # Wait for it to disappear before trying to navigate back.
     try:
-        page.wait_for_selector(".freeze-message-container", state="hidden", timeout=SLOW_TIMEOUT)
+        _safe_wait_selector(page, ".freeze-message-container", state="hidden")
         print("   ✓ Freeze overlay cleared")
     except Exception:
         print("   ⚠ Freeze overlay still visible, proceeding anyway")
@@ -1883,7 +1916,7 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
             # Wait for Image Manager to fully render.
             # networkidle fires too early — Vue still needs time to mount buttons.
             # wait_for_selector polls until visible instead of checking once.
-            page.wait_for_selector("button:has-text('Image Manager')", state="visible", timeout=SLOW_TIMEOUT)
+            _safe_wait_selector(page, "button:has-text('Image Manager')", state="visible")
 
             print(f"   ✓ Opened detail page")
             process_unit(page, None, name, mapping, states)
@@ -2052,12 +2085,12 @@ def main():
             print("   ⏳ Waiting for the loading overlay to clear…")
             while True:
                 try:
-                    page.wait_for_selector(".freeze-message-container", state="hidden", timeout=SLOW_TIMEOUT)
+                    _safe_wait_selector(page, ".freeze-message-container", state="hidden")
                     break
                 except Exception:
                     continue
             try:
-                page.wait_for_selector("div.card.cursor-pointer.rounded-0", state="visible", timeout=SLOW_TIMEOUT)
+                _safe_wait_selector(page, "div.card.cursor-pointer.rounded-0", state="visible")
             except Exception:
                 pass
             print("   ✓ List reloaded")
@@ -2182,7 +2215,7 @@ def main():
             except Exception:
                 pass
             try:
-                page.wait_for_selector("div.card.cursor-pointer.rounded-0", state="visible", timeout=SLOW_TIMEOUT)
+                _safe_wait_selector(page, "div.card.cursor-pointer.rounded-0", state="visible")
             except Exception:
                 pass
 
@@ -2212,7 +2245,7 @@ def main():
             # Wait for the freeze overlay to disappear (loading screen overlay).
             # This ensures the cards are truly interactive and not obscured by loading state.
             try:
-                page.wait_for_selector(".freeze-message-container", state="hidden", timeout=SLOW_TIMEOUT)
+                _safe_wait_selector(page, ".freeze-message-container", state="hidden")
             except Exception:
                 pass
 
@@ -2225,11 +2258,11 @@ def main():
                     back_btn = page.locator("button.btn-icon:has(i.fa-angle-left)").last
                     back_btn.click(timeout=SLOW_TIMEOUT)
                     try:
-                        page.wait_for_selector(".freeze-message-container", state="hidden", timeout=SLOW_TIMEOUT)
+                        _safe_wait_selector(page, ".freeze-message-container", state="hidden")
                     except Exception:
                         pass
                     _safe_wait_networkidle(page)
-                    page.wait_for_selector("div.card.cursor-pointer.rounded-0", state="visible", timeout=SLOW_TIMEOUT)
+                    _safe_wait_selector(page, "div.card.cursor-pointer.rounded-0", state="visible")
                     try:
                         page_num = int(page.locator("input[type='number']").last.input_value().strip())
                     except Exception:
