@@ -92,26 +92,6 @@ class UnitSkipped(Exception):
     pass
 
 
-class VersionRefresh(Exception):
-    """Raised to abort the in-flight work, reload the saved filtered list URL,
-    rescan, and reprocess from the first card. Triggered by the Frappe
-    'Version Updated' modal (locator handler / post-wait check) or the GUI
-    'Refresh Page' button. Run data (mapping, states, successful uploads,
-    results) is preserved — only the live card list is re-read."""
-    pass
-
-
-# Set True by the locator handler, the GUI 'Refresh Page' button, or a post-wait
-# modal check. Read at checkpoints (_check_version_refresh) to raise
-# VersionRefresh. Reset to False after each saved-list reload. Cross-thread: the
-# GUI main thread sets it, the automation thread reads it (atomic bool assign).
-_version_refresh_pending = False
-
-# Hook installed by gui.py: called once _filtered_list_url is captured so the GUI
-# can reveal its 'Refresh Page' button. None in terminal mode. Signature: () -> None
-_notify_url_saved = None
-
-
 # Hook installed by gui.py so a timed-out prompt can release the blocked GUI
 # input and dismiss its panel. None in terminal mode. Signature: (default) -> None
 _cancel_gui_input = None
@@ -200,78 +180,6 @@ def _dismiss_upload_modals(page):
             page.locator(MODAL).wait_for(state="hidden", timeout=SLOW_TIMEOUT)
     except Exception:
         pass
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  "VERSION UPDATED" MODAL  →  REFRESH FROM SAVED FILTERED LIST
-# ═══════════════════════════════════════════════════════════════════
-# Frappe shows a msgprint dialog ("Version Updated") at random mid-step. Its own
-# "Refresh" button reloads the detail page (wrong — loses our place), so instead
-# we reload the saved filtered list, rescan, and reprocess from card 1. The
-# non_published_units=1 filter drops already-published units from the list, so
-# the replay only touches units that still need work.
-_VERSION_MODAL_TITLE = "Version Updated"
-
-
-def _version_modal_visible(page) -> bool:
-    """True if the Frappe 'Version Updated' msgprint dialog is on screen.
-    Matched by .modal-dialog.msgprint-dialog class + title text so it never
-    collides with the upload sub-modal (.modal.fade.show)."""
-    try:
-        return bool(page.evaluate(
-            """(title) => {
-                const dlgs = document.querySelectorAll('.modal-dialog.msgprint-dialog');
-                for (const d of dlgs) {
-                    const t = d.querySelector('.modal-title, .modal-header, h4');
-                    if (t && t.innerText.includes(title)) return true;
-                }
-                return false;
-            }""",
-            _VERSION_MODAL_TITLE,
-        ))
-    except Exception:
-        return False
-
-
-def _check_version_refresh(page=None):
-    """Checkpoint: raise VersionRefresh if a refresh was requested (modal handler
-    or GUI button set the flag) or — when `page` is given — if the Version Updated
-    modal is currently on screen. Call after waits and between steps."""
-    global _version_refresh_pending
-    if _version_refresh_pending:
-        raise VersionRefresh("refresh requested")
-    if page is not None and _version_modal_visible(page):
-        _version_refresh_pending = True
-        raise VersionRefresh("Version Updated modal detected")
-
-
-def _reload_saved_list(page):
-    """Reload the saved filtered list URL (NOT a Chrome tab refresh), wait out the
-    freeze overlay indefinitely, then wait for the cards. Clears the refresh flag.
-    Reused by both the Version Updated modal and the manual GUI Refresh button."""
-    global _version_refresh_pending
-    print("   🔄 Refreshing list from the saved filter and resuming…")
-    print("   ↳ Navigating to filtered list…")
-    try:
-        page.goto(_filtered_list_url, timeout=SLOW_TIMEOUT)
-    except Exception as e:
-        print(f"   ⚠ Reload hiccup: {e} — continuing")
-    try:
-        page.wait_for_load_state("networkidle", timeout=SLOW_TIMEOUT)
-    except Exception:
-        pass
-    print("   ↳ Waiting for the loading overlay to clear…")
-    while True:
-        try:
-            page.wait_for_selector(".freeze-message-container", state="hidden", timeout=SLOW_TIMEOUT)
-            break
-        except Exception:
-            continue
-    try:
-        page.wait_for_selector("div.card.cursor-pointer.rounded-0", state="visible", timeout=SLOW_TIMEOUT)
-    except Exception:
-        pass
-    _version_refresh_pending = False
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1124,10 +1032,6 @@ def step_upload_images(page: Page, paths: list, project: str, unit_type: str, st
         confirm("STEP 1 — Images uploaded. Verify they appeared.")
     except Exception as e:
         print(f"   ⚠ Timeout waiting for upload results ({e}) — continuing anyway")
-        # The upload wait is a raw wait_for_function (outside the locator-handler
-        # net). If the Version Updated modal is what stalled it, refresh now
-        # instead of blocking again on a second long wait.
-        _check_version_refresh(page)
         page.wait_for_selector('.file-preview-container .file-preview', timeout=SLOW_TIMEOUT)
 
     # ── Check for errors (ONLY on first upload for this type) ──────
@@ -1473,9 +1377,6 @@ def step_publish(page: Page, n_images: int):
 #  PROCESS ONE UNIT
 # ═══════════════════════════════════════════════════════════════════
 def process_unit(page: Page, url: str, name: str, mapping: dict, states: dict):
-    # Bail out before any work if a refresh is pending (modal / manual button).
-    _check_version_refresh(page)
-
     # Resolve project and type from name
     parsed_project, parsed_type = extract_project_and_type(name)
 
@@ -1587,13 +1488,7 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
                     go_back_to_list(page)
                 except Exception as ge:
                     print(f"   ⚠ Could not return to list cleanly: {ge}")
-            except VersionRefresh:
-                raise   # bubble to main()'s page loop → reload saved list, replay
             except Exception as e:
-                # A modal that slipped past the checkpoints lands here as a generic
-                # error — convert to a refresh instead of stalling on the prompt.
-                if _version_refresh_pending or _version_modal_visible(page):
-                    raise VersionRefresh("Version Updated during unit")
                 print(f"  ✗ ERROR: {e}")
                 results.append({"page": page_num, "unit": name, "url": url, "status": f"FAILED: {e}"})
                 input("  ⚠ Fix manually if needed, then press Enter to continue… ")
@@ -1684,13 +1579,7 @@ def process_current_page(page: Page, mapping: dict, page_num: int, results: list
                 go_back_to_list(page)
             except Exception as ge:
                 print(f"   ⚠ Could not return to list cleanly: {ge}")
-        except VersionRefresh:
-            raise   # bubble to main()'s page loop → reload saved list, replay
         except Exception as e:
-            # A modal that slipped past the checkpoints lands here as a generic
-            # error — convert to a refresh instead of stalling on the prompt.
-            if _version_refresh_pending or _version_modal_visible(page):
-                raise VersionRefresh("Version Updated during unit")
             print(f"  ✗ ERROR: {e}")
             results.append({"page": page_num, "unit": name, "url": page.url, "status": f"FAILED: {e}"})
             input("  ⚠ Fix manually if needed, then press Enter to continue… ")
@@ -1755,23 +1644,6 @@ def main():
         # Show the connection only after the user has navigated.
         print(f"\n✅  Connected  |  {page.url}")
 
-        # Global net for the Frappe 'Version Updated' modal: whenever it appears
-        # during any Playwright auto-wait, flag a refresh. The actual reload runs
-        # on this (automation) thread at the next checkpoint — the handler must
-        # not navigate. Wrapped in try/except: older Playwright lacks
-        # add_locator_handler, in which case the post-wait checks + manual button
-        # still cover detection.
-        def _on_version_modal(*_a):
-            global _version_refresh_pending
-            _version_refresh_pending = True
-        try:
-            page.add_locator_handler(
-                page.locator(".modal-dialog.msgprint-dialog").filter(has_text=_VERSION_MODAL_TITLE),
-                _on_version_modal,
-            )
-        except Exception as _e:
-            print(f"   ℹ Version-modal auto-handler unavailable ({_e}) — using post-wait checks")
-
         # Detect which tab is active BEFORE scanning. Rent reuses the whole flow
         # but skips price/down-payment logic. Only Rent and Re-Sale are valid —
         # Primary/unknown means the user is on the wrong tab, so block with a
@@ -1819,14 +1691,6 @@ def main():
                 pass
             print("   ✓ List reloaded")
 
-        # URL captured & saved (whether or not it needed fixing) — let the GUI
-        # reveal its 'Refresh Page' button now that there's a saved filter to use.
-        if callable(_notify_url_saved):
-            try:
-                _notify_url_saved()
-            except Exception:
-                pass
-
         print("  Scanning page for projects and unit types…")
         project_types = scan_projects_types(page)
         if not project_types:
@@ -1847,31 +1711,7 @@ def main():
         abort = False
 
         while True:
-            # Process the page; a Version Updated modal / manual Refresh raises
-            # VersionRefresh, so reload the saved list and replay from card 1.
-            # page_num is kept as-is for log/results continuity (per design). Run
-            # data (mapping/states/results/_successful_uploads) is preserved.
-            while True:
-                try:
-                    pre_count = page.locator("div.card.cursor-pointer.rounded-0").count()
-                except Exception:
-                    pre_count = 0
-                try:
-                    process_current_page(page, mapping, page_num, results, states)
-                    break
-                except VersionRefresh:
-                    _reload_saved_list(page)
-                    try:
-                        new_count = page.locator("div.card.cursor-pointer.rounded-0").count()
-                    except Exception:
-                        new_count = 0
-                    dropped = pre_count - new_count if pre_count > new_count else 0
-                    msg = f"   ✓ List reloaded  —  {new_count} unit(s) remaining"
-                    if dropped:
-                        msg += f" ({dropped} published unit(s) filtered out)"
-                    print(msg)
-                    print(f"   ↳ Resuming from page {page_num}, card 1 of {new_count}")
-                    continue
+            process_current_page(page, mapping, page_num, results, states)
 
             pg_ok   = sum(1 for r in results if r["page"] == page_num and r["status"] == "OK")
             pg_fail = sum(1 for r in results if r["page"] == page_num and r["status"] != "OK")
