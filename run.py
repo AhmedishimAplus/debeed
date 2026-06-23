@@ -1940,6 +1940,28 @@ def main():
         "    path for that project. This can also happen when you choose\n"
         "    “same images for all.”"
     )
+    print(
+        "  • Units are grouped by project, then by type. After each scan the\n"
+        "    program shows an image-mapping summary and asks “All good?”. If\n"
+        "    you click Yes (or do nothing for 2 minutes) it starts uploading.\n"
+        "    If you click No it asks which project has the problem: for a\n"
+        "    newly scanned project you choose whether it is a behaviour issue\n"
+        "    (same-for-all vs. per-type) or a path issue; for a project seen\n"
+        "    on an earlier page it only asks for new paths for the types just\n"
+        "    found on this page. After any fix it re-shows the summary and\n"
+        "    asks “All good?” again, looping until you confirm."
+    )
+    print(
+        "  • Unit types are sorted into three categories: Small (apartments,\n"
+        "    studios, duplexes, chalets, …), Big (villas, townhouses,\n"
+        "    standalones, buildings, …) and Other (land, offices, retail,\n"
+        "    clinics, …). When a new per-type unit appears on a later page and\n"
+        "    you don’t give it a folder within 2 minutes, the program borrows\n"
+        "    the images from another already-uploaded type in the SAME\n"
+        "    category and project (e.g. a new Duplex can reuse Apartment\n"
+        "    images, both Small). Other/uncategorized types never borrow — you\n"
+        "    must always provide their folder."
+    )
     print("─"*50)
 
     print("\n  Launching Chrome…")
