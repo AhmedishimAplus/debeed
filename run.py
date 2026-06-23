@@ -1610,7 +1610,12 @@ def step_publish(page: Page, n_images: int):
         dp_checked = page.locator(DOWN_PAYMENT_CB).is_checked()
         print(f"   ↳ Current state: Unit Price={up_checked}  |  Down Payment={dp_checked}")
 
-        if choice == "down_payment":
+        # Small check: if the suitable price display checkbox is already checked,
+        # nothing to change — skip straight to image selection.
+        suitable_cb = DOWN_PAYMENT_CB if choice == "down_payment" else UNIT_PRICE_CB
+        if page.locator(suitable_cb).is_checked():
+            print(f"   ↳ Suitable price display already checked — skipping to image selection")
+        elif choice == "down_payment":
             print(f"   ↳ Setting to: Down Payment")
             if page.locator(UNIT_PRICE_CB).is_checked():
                 page.locator(UNIT_PRICE_CB).click()
